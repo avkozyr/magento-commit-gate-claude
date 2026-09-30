@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+set -u
+
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SKILL_DIR=$(cd "$(dirname "$SELF")/.." && pwd -P)
+SCRIPT="$SKILL_DIR/scripts/perf-gate"
+
+PATHSPEC=(
+    ':(glob)app/code/**/*.php'
+    ':(glob)app/code/**/*.phtml'
+    ':(glob)app/design/**/*.php'
+    ':(glob)app/design/**/*.phtml'
+    ':(glob)app/code/**/etc/**/*.xml'
+    ':(glob)app/code/**/layout/*.xml'
+    ':(glob)app/design/**/layout/*.xml'
+)
+MARKERS="perf query calls"
+PHPMD_RULESETS="dev/tests/static/testsuite/Magento/Test/Php/_files/phpmd/ruleset.xml vendor/magento/magento2-base/dev/tests/static/testsuite/Magento/Test/Php/_files/phpmd/ruleset.xml"
+CONTAINER_DIR=/tmp/perf-gate
+DB_LOG=var/debug/db.log
+
+die() {
+    echo "perf-gate: $*" >&2
+    exit 2
+}
+
+usage() {
+    cat >&2 <<EOF
+Usage: perf-gate <command>
+  install              create .claude/perf-gate.conf and register the hook (once per project)
+  hook                 PreToolUse hook (reads the tool input JSON on stdin)
+  files [--php]        gated files of the working diff
+  hash                 hash of the gated working diff
+  mark perf|query|calls
+  audit                A/B query + call count audit on homepage, PLP, PDP
+EOF
+    exit 1
+}
+
+go_root() {
+    cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || die "not inside a git repository"
+    ROOT=$(pwd -P)
+    case "$SCRIPT" in
+        "$ROOT"/*) SCRIPT_REL=${SCRIPT#"$ROOT"/} ;;
+        *) die "the skill must be installed inside the project, e.g. .claude/skills/ ($SCRIPT)" ;;
+    esac
+}
+
+run() {
+    if [ -d .ddev ] && command -v ddev >/dev/null 2>&1; then
+        ddev exec "$@"
+    else
+        "$@"
+    fi
+}
+
+cmd_files() {
+    if [ "${1:-}" = --php ]; then
+        git diff HEAD --name-only --diff-filter=ACMR -- "${PATHSPEC[@]}" | grep -E '\.(php|phtml)$'
+    else
+        git diff HEAD --name-only --diff-filter=ACMR -- "${PATHSPEC[@]}"
+    fi
+    return 0
+}
+
+cmd_hash() {
+    git diff HEAD -- "${PATHSPEC[@]}" | shasum | cut -c1-12
+}
+
+marker_path() {
+    echo "$(git rev-parse --git-dir)/.claude-$1-ok-$(cmd_hash)"
+}
+
+cmd_mark() {
+    case " $MARKERS " in
+        *" ${1:-} "*) [ -n "${1:-}" ] ;;
+        *) false ;;
+    esac || usage
+    if [ -z "$(cmd_files)" ]; then
+        echo "No gated changes in the working diff — no marker needed." >&2
+        return 0
+    fi
+    touch "$(marker_path "$1")"
+    marker_path "$1"
+}
+
+cmd_install() {
+    go_root
+
+    if [ ! -f .claude/perf-gate.conf ]; then
+        cp "$SKILL_DIR/perf-gate.conf.dist" .claude/perf-gate.conf
+        echo "perf-gate: .claude/perf-gate.conf created, set PAGE_PLP and PAGE_PDP"
+    fi
+
+    local settings=.claude/settings.json
+    local hook="\"\$CLAUDE_PROJECT_DIR\"/$SCRIPT_REL hook"
+    if [ -f "$settings" ] && grep -qF "$SCRIPT_REL hook" "$settings"; then
+        echo "perf-gate: hook already registered"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "perf-gate: jq not found — add a PreToolUse hook (matcher Bash, timeout 300) with command $hook to .claude/settings.json" >&2
+        return 0
+    fi
+    [ -f "$settings" ] || echo '{}' > "$settings"
+    local tmp="$settings.tmp.$$"
+    if jq --arg cmd "$hook" '.hooks.PreToolUse += [{"matcher": "Bash", "hooks": [{"type": "command", "command": $cmd, "timeout": 300}]}]' "$settings" > "$tmp"; then
+        mv "$tmp" "$settings"
+        echo "perf-gate: pre-commit hook registered in .claude/settings.json"
+    else
+        rm -f "$tmp"
+        echo "perf-gate: .claude/settings.json is not valid JSON, hook not registered" >&2
+    fi
+}
+
+cmd_hook() {
+    local input cmd
+    input=$(cat)
+    if ! cmd=$(printf '%s' "$input" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' 2>/dev/null); then
+        case "$input" in
+            *"git"*"commit"*) echo "Quality gate cannot parse hook input (python3 missing?) — blocking commit." >&2; exit 2 ;;
+            *) exit 0 ;;
+        esac
+    fi
+    local commit_re='(^|&&|\|\||;|\|)[[:space:]]*git[[:space:]]+((-C|-c)[[:space:]]+[^[:space:]]+[[:space:]]+|--?[^[:space:]]+[[:space:]]+)*commit([[:space:]]|$)'
+    printf '%s' "$cmd" | grep -qE "$commit_re" || exit 0
+
+    cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+    go_root
+    [ -n "$(cmd_files)" ] || exit 0
+
+    local php_files out="" output list ruleset="" candidate
+    php_files=$(cmd_files --php)
+    if [ -n "$php_files" ]; then
+        if [ ! -f phpstan.neon ] && [ ! -f phpstan.neon.dist ]; then
+            out="$out
+
+phpstan: no phpstan.neon or phpstan.neon.dist in the project root — add one (see the magento-phpstan-check skill)."
+        elif ! output=$(run vendor/bin/phpstan analyse --no-progress --error-format=raw $php_files 2>&1); then
+            out="$out
+
+phpstan (fix via the magento-phpstan-check skill):
+$output"
+        fi
+
+        for candidate in $PHPMD_RULESETS; do
+            [ -f "$candidate" ] && { ruleset=$candidate; break; }
+        done
+        if [ -z "$ruleset" ]; then
+            out="$out
+
+phpmd: Magento ruleset not found (looked for: $PHPMD_RULESETS)."
+        else
+            list=$(printf '%s\n' "$php_files" | tr '\n' ',' | sed 's/,$//')
+            output=$(run vendor/bin/phpmd "$list" text "$ruleset" 2>&1) || out="$out
+
+phpmd (fix via the magento-phpmd-check skill):
+$output"
+        fi
+    fi
+    if [ -n "$out" ]; then
+        echo "Code quality gate failed — fix before committing:$out" >&2
+        exit 2
+    fi
+
+    local hash git_dir f pending=""
+    hash=$(cmd_hash)
+    git_dir=$(git rev-parse --git-dir)
+    for f in "$git_dir"/.claude-*-ok-*; do
+        case "$f" in
+            *-ok-"$hash") ;;
+            *) rm -f "$f" ;;
+        esac
+    done
+    [ -f "$git_dir/.claude-perf-ok-$hash" ] || pending="$pending
+- run the magento-performance-review skill; on pass: $SCRIPT_REL mark perf"
+    if [ ! -f "$git_dir/.claude-query-ok-$hash" ] || [ ! -f "$git_dir/.claude-calls-ok-$hash" ]; then
+        pending="$pending
+- run the query-count-audit and call-count-audit skills (one run for both): $SCRIPT_REL audit"
+    fi
+
+    if [ -n "$pending" ]; then
+        echo "Static checks passed. Pending before commit:$pending
+Run each command in its own Bash call BEFORE the commit — the gate checks markers before the commit command runs, so '… && git commit' in one call is always blocked. Then retry the commit." >&2
+        exit 2
+    fi
+    exit 0
+}
+
+sql_counts() {
+    awk '
+        function emit(s) { gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); count[s]++ }
+        /^SQL: / { if (cur != "") emit(cur); cur = substr($0, 6); next }
+        cur == "" { next }
+        /^$/ || /^(AFF|TIME|BIND|## )/ { emit(cur); cur = ""; next }
+        { cur = cur " " $0 }
+        END { if (cur != "") emit(cur); for (s in count) printf "%d\t%s\n", count[s], s }
+    ' "$1"
+}
+
+call_counts() {
+    zcat -f "$1" | awk '
+        /^c?fn=\(/ {
+            line = $0
+            is_call = substr(line, 1, 1) == "c"
+            sub(/^c?fn=\(/, "", line)
+            id = line; sub(/\).*/, "", id)
+            rest = line; sub(/^[0-9]+\) ?/, "", rest)
+            if (rest != "") name[id] = rest
+            if (is_call) callee = (id in name) ? name[id] : id
+            next
+        }
+        callee != "" && /^calls=/ { split(substr($0, 7), part, " "); calls[callee] += part[1]; callee = "" }
+        END { for (f in calls) printf "%.0f\t%s\n", calls[f], f }
+    '
+}
+
+increases() {
+    awk -F'\t' '
+        NR == FNR { a[$2] = $1; next }
+        { base = ($2 in a) ? a[$2] : 0; if ($1 > base) printf "%.0f\t%.0f\t%.0f\t%s\n", $1 - base, base, $1, $2 }
+    ' "$1" "$2" | sort -t"$(printf '\t')" -k1,1nr | head -n 20
+}
+
+cmd_measure() {
+    mkdir -p "$CONTAINER_DIR"
+    case "${1:-}" in
+        reset)
+            : > "$DB_LOG"
+            rm -f "$CONTAINER_DIR"/cachegrind.out.*
+            ;;
+        collect-query)
+            cp "$DB_LOG" "$CONTAINER_DIR/$2.sql.log"
+            sql_counts "$CONTAINER_DIR/$2.sql.log" | awk -F'\t' '{ n += $1 } END { printf "%.0f\n", n }'
+            ;;
+        collect-calls)
+            set -- "$2" "$CONTAINER_DIR"/cachegrind.out.*
+            [ "$#" -eq 2 ] && [ -f "$2" ] || { echo "Expected exactly 1 profile in $CONTAINER_DIR" >&2; exit 1; }
+            mv "$2" "$CONTAINER_DIR/$1.cg"
+            zcat -f "$CONTAINER_DIR/$1.cg" | awk '/^calls=/ { split(substr($0, 7), part, " "); n += part[1] } END { printf "%.0f\n", n }'
+            ;;
+        diff-query)
+            sql_counts "$CONTAINER_DIR/$2.sql.log" > "$CONTAINER_DIR/diff-a"
+            sql_counts "$CONTAINER_DIR/$3.sql.log" > "$CONTAINER_DIR/diff-b"
+            echo "Added SQL statements:"
+            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" | awk -F'\t' '{ printf "  +%s  %s\n", $1, substr($4, 1, 300) }'
+            ;;
+        diff-calls)
+            call_counts "$CONTAINER_DIR/$2.cg" > "$CONTAINER_DIR/diff-a"
+            call_counts "$CONTAINER_DIR/$3.cg" > "$CONTAINER_DIR/diff-b"
+            echo "Functions called more often:"
+            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" | awk -F'\t' '{ printf "  +%s  %s (A=%s B=%s)\n", $1, $4, $2, $3 }'
+            ;;
+        *) usage ;;
+    esac
+}
+
+cmd_audit() {
+    go_root
+    [ -d .ddev ] && command -v ddev >/dev/null 2>&1 || die "a ddev project is required"
+
+    local conf=".claude/perf-gate.conf"
+    [ -f "$conf" ] || die "missing $conf — run $SCRIPT_REL install"
+    PAGE_HOME=/ PAGE_PLP="" PAGE_PDP="" BASE_URL="" PHP_VERSION=""
+    . "./$conf"
+    [ -n "$PAGE_PLP" ] && [ -n "$PAGE_PDP" ] || die "set PAGE_PLP and PAGE_PDP in $conf"
+
+    local env host code
+    env=$(ddev exec printenv DDEV_PHP_VERSION DDEV_HOSTNAME 2>/dev/null | tr -d '\r') || die "ddev project is not running"
+    PHP_VERSION=${PHP_VERSION:-$(printf '%s\n' "$env" | sed -n 1p)}
+    if [ -z "$BASE_URL" ]; then
+        for host in $(printf '%s\n' "$env" | sed -n 2p | tr ',' ' '); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "https://$host$PAGE_HOME")
+            [ "$code" = 200 ] && { BASE_URL="https://$host"; break; }
+        done
+        [ -n "$BASE_URL" ] || die "no ddev hostname answers 200 on $PAGE_HOME, set BASE_URL in $conf"
+    fi
+    BASE_URL=${BASE_URL%/}
+
+    if [ -z "$(cmd_files)" ]; then
+        echo "No gated changes in the working diff, nothing to audit."
+        exit 0
+    fi
+    HASH=$(cmd_hash)
+    INI="/etc/php/$PHP_VERSION/fpm/conf.d/zz-perf-gate.ini"
+    STASH_MSG="perf-gate-audit $HASH"
+    STASHED=0 LOGGING=0 PROFILER=0 XDEBUG_WAS_ON=0 NEEDS_REBUILD=0
+    mkdir -p var/perf-gate
+
+    trap audit_teardown EXIT
+    trap 'exit 130' INT TERM
+
+    LOGGING=1
+    cli bin/magento dev:query-log:enable --include-call-stack=false >/dev/null || die "query log enable failed"
+    case "$(ddev xdebug status 2>/dev/null)" in *enabled*) XDEBUG_WAS_ON=1 ;; esac
+    PROFILER=1
+    [ "$XDEBUG_WAS_ON" = 1 ] || ddev xdebug on >/dev/null || die "ddev xdebug on failed"
+    ddev exec "sudo sh -c 'echo xdebug.mode=profile > $INI; echo xdebug.start_with_request=trigger >> $INI; echo xdebug.output_dir=$CONTAINER_DIR >> $INI' && mkdir -p $CONTAINER_DIR && chmod 777 $CONTAINER_DIR && sudo supervisorctl restart php-fpm" >/dev/null \
+        || die "profiler setup failed"
+
+    local count
+    count=$(git stash list | wc -l)
+    git stash push -u -m "$STASH_MSG" -- app/code app/design >/dev/null || die "git stash failed"
+    [ "$(git stash list | wc -l)" -gt "$count" ] || die "git stash stored nothing"
+    STASHED=1
+    [ -z "$(cmd_files)" ] || die "tree still has gated changes after stash"
+
+    NEEDS_REBUILD=1
+    rebuild a || die "rebuild A failed"
+    measure_side a
+
+    case "$(git stash list -1)" in *"$STASH_MSG"*) ;; *) die "top stash is not the audit stash" ;; esac
+    git stash pop >/dev/null || die "git stash pop failed"
+    STASHED=0
+    [ "$(cmd_hash)" = "$HASH" ] || die "working diff differs after stash pop"
+
+    rebuild b || die "rebuild B failed"
+    NEEDS_REBUILD=0
+    measure_side b
+
+    audit_teardown
+    audit_report
+}
+
+cli() {
+    ddev exec env XDEBUG_MODE=off "$@"
+}
+
+in_container() {
+    ddev exec bash "$SCRIPT_REL" "$@"
+}
+
+page_path() {
+    case "$1" in
+        home) echo "$PAGE_HOME" ;;
+        plp) echo "$PAGE_PLP" ;;
+        pdp) echo "$PAGE_PDP" ;;
+    esac
+}
+
+rebuild() {
+    echo "[$1] setup:di:compile + cache:flush"
+    cli bin/magento setup:di:compile >"var/perf-gate/compile-$1.log" 2>&1 || {
+        tail -20 "var/perf-gate/compile-$1.log" >&2
+        return 1
+    }
+    cli bin/magento cache:flush >/dev/null
+}
+
+measure_side() {
+    local side=$1 page url sep code query calls
+    for page in home plp pdp; do
+        url="$BASE_URL$(page_path "$page")"
+        sep='?'
+        case "$url" in *\?*) sep='&' ;; esac
+        for _ in 1 2; do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "${url}${sep}nc=warm")
+            [ "$code" = 200 ] || die "[$side] warmup $url answered $code"
+        done
+        in_container measure reset || die "[$side] measure reset failed"
+        code=$(curl -sk -o /dev/null -w '%{http_code}' "${url}${sep}nc=$side$$$RANDOM&XDEBUG_TRIGGER=1")
+        [ "$code" = 200 ] || die "[$side] $url answered $code"
+        query=$(in_container measure collect-query "$side-$page") || die "[$side] collecting $page queries failed"
+        calls=$(in_container measure collect-calls "$side-$page") || die "[$side] collecting $page calls failed"
+        eval "V_query_${side}_${page}=$query V_calls_${side}_${page}=$calls"
+        echo "[$side] $page: $query queries, $calls calls"
+    done
+}
+
+audit_teardown() {
+    trap - EXIT INT TERM
+    if [ "$STASHED" = 1 ]; then
+        if git stash pop >/dev/null; then
+            STASHED=0
+        else
+            echo "perf-gate: git stash pop failed, working changes are kept in the stash ($STASH_MSG) — restore by hand" >&2
+        fi
+    fi
+    [ "$LOGGING" = 1 ] && cli bin/magento dev:query-log:disable >/dev/null
+    if [ "$PROFILER" = 1 ]; then
+        ddev exec "sudo rm -f $INI" >/dev/null
+        if [ "$XDEBUG_WAS_ON" = 1 ]; then
+            ddev exec "sudo supervisorctl restart php-fpm" >/dev/null
+        else
+            ddev xdebug off >/dev/null
+        fi
+    fi
+    LOGGING=0 PROFILER=0
+    [ "$NEEDS_REBUILD" = 1 ] && [ "$STASHED" = 0 ] && rebuild restore && NEEDS_REBUILD=0
+    local code
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$BASE_URL$PAGE_HOME")
+    [ "$code" = 200 ] || echo "perf-gate: homepage answers $code after teardown" >&2
+}
+
+report_metric() {
+    local metric=$1 page a b status red=""
+    printf '\n%-5s %24s  %s\n' page "$metric A→B" status
+    for page in home plp pdp; do
+        eval "a=\$V_${metric}_a_$page b=\$V_${metric}_b_$page"
+        status='✅'
+        if [ "$b" -gt "$a" ]; then
+            status='🔴'
+            red="$red $page"
+        fi
+        printf '%-5s %24s  %s\n' "$page" "$a→$b" "$status"
+    done
+
+    if [ -z "$red" ]; then
+        echo "$metric: all pages green. Marker: $(cmd_mark "$metric")"
+        return 0
+    fi
+    for page in $red; do
+        echo
+        echo "=== $metric $page ($BASE_URL$(page_path "$page"))"
+        in_container measure "diff-$metric" "a-$page" "b-$page"
+    done
+    echo "$metric: degradation on:$red — no marker written."
+    return 1
+}
+
+audit_report() {
+    local failed=0
+    report_metric query || failed=1
+    report_metric calls || failed=1
+    exit "$failed"
+}
+
+case "${1:-}" in
+    install) cmd_install ;;
+    hook) cmd_hook ;;
+    files) go_root; cmd_files "${2:-}" ;;
+    hash) go_root; cmd_hash ;;
+    mark) go_root; cmd_mark "${2:-}" ;;
+    audit) cmd_audit ;;
+    measure) shift; cmd_measure "$@" ;;
+    *) usage ;;
+esac
