@@ -41,9 +41,18 @@ npx skills update -p
 ```
 
 The CLI copies each skill into `.claude/skills/<name>/` and records the source in
-`skills-lock.json`. Commit `skills-lock.json` (used by `npx skills update`) and add the installed
-skill folders to the project's `.gitignore`; every developer runs the install command once after
-cloning. Some skill sets need a one-time setup step — see their doc.
+`skills-lock.json`. Keep both out of git: every developer runs the install command once after
+cloning, and `npx skills update` works from the local lock. `npx skills update` replaces the
+copies with symlinks into `.agents/skills/`, so ignore the skill paths without a trailing slash
+(a symlink is not a directory for git):
+
+```gitignore
+/skills-lock.json
+/.agents
+/.claude/skills/<skill-name>
+```
+
+Some skill sets need a one-time setup step — see their doc.
 
 `npx skills experimental_install` (restore from the lock) installs into `.agents/skills/`, which
 Claude Code does not read — use `npx skills add … -a claude-code` instead.

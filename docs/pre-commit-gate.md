@@ -54,8 +54,8 @@ Fill in `.claude/perf-gate.conf`:
 | `BASE_URL` | no | override; default = first ddev hostname answering 200 over https on `PAGE_HOME` |
 | `PHP_VERSION` | no | override; default = ddev `DDEV_PHP_VERSION` |
 
-Commit `skills-lock.json`, `.claude/perf-gate.conf` and `.claude/settings.json`; gitignore the
-five installed skill folders. Each developer installs the skills once after cloning (the
+Commit `.claude/perf-gate.conf` and `.claude/settings.json`; gitignore `skills-lock.json`,
+`.agents` and the five installed skill paths (see the [README](../README.md)). Each developer installs the skills once after cloning (the
 `npx skills add` command above — `perf-gate install` is only needed once per project).
 
 Update to the latest version: `npx skills update -p`.

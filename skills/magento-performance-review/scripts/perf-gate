@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
-SKILL_DIR=$(cd "$(dirname "$SELF")/.." && pwd -P)
+SCRIPT_DIR=$(dirname "$0")
+SKILL_DIR="$(cd -L "$SCRIPT_DIR/../.." && pwd -P)/$(basename "$(cd -L "$SCRIPT_DIR/.." && pwd -L)")"
 SCRIPT="$SKILL_DIR/scripts/perf-gate"
 
 PATHSPEC=(
