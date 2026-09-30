@@ -54,6 +54,18 @@ npx skills experimental_install
 It installs every skill at the ref in the lock into `.agents/skills/`; the committed symlinks
 make them visible to Claude Code.
 
+Optional — restore on every `composer install` (skipped in CI and without `npx`, never fails
+composer):
+
+```json
+"scripts": {
+    "skills-install": [
+        "[ -n \"$CI\" ] || ! command -v npx >/dev/null || DISABLE_TELEMETRY=1 npx -y skills experimental_install || echo 'skills install failed, run: npx skills experimental_install'"
+    ],
+    "post-install-cmd": ["@skills-install"]
+}
+```
+
 Move to another release: set `"ref"` of the skills in `skills-lock.json` to the new tag, run
 `npx skills experimental_install`, commit the lock. (`npx skills update` keeps the pinned ref.)
 
