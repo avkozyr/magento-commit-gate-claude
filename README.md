@@ -24,38 +24,40 @@ Skill sets with extra setup:
 
 ## Configuration
 
-From the project root:
+Skills are pinned to a release tag, like `composer.lock` pins packages. From the project root
+(the `.claude/` folder must exist):
 
 ```bash
-# list the skills in this repository
-npx skills add avkozyr/magento-commit-gate-claude --list
+# list the skills of a release
+npx skills add https://github.com/avkozyr/magento-commit-gate-claude.git#v1.0.0 --list
 
-# install all skills
-npx skills add avkozyr/magento-commit-gate-claude --skill '*' -a claude-code -y
-
-# install selected skills
-npx skills add avkozyr/magento-commit-gate-claude --skill magento-phpstan-check -a claude-code -y
-
-# update installed skills to the latest version
-npx skills update -p
+# add skills pinned to a release (all, or name them instead of '*')
+npx skills add https://github.com/avkozyr/magento-commit-gate-claude.git#v1.0.0 --skill '*' -y
 ```
 
-The CLI copies each skill into `.claude/skills/<name>/` and records the source in
-`skills-lock.json`. Keep both out of git: every developer runs the install command once after
-cloning, and `npx skills update` works from the local lock. `npx skills update` replaces the
-copies with symlinks into `.agents/skills/`, so ignore the skill paths without a trailing slash
-(a symlink is not a directory for git):
+The CLI stores the files in `.agents/skills/<name>/`, links `.claude/skills/<name>` to them and
+records source and `ref` (the tag) in `skills-lock.json`. Use the full git URL: the
+`owner/repo#tag` shorthand is rejected.
+
+Commit `skills-lock.json` and the `.claude/skills/<name>` symlinks; ignore the files:
 
 ```gitignore
-/skills-lock.json
 /.agents
-/.claude/skills/<skill-name>
 ```
 
-Some skill sets need a one-time setup step — see their doc.
+After cloning, or after someone changed the lock — the equivalent of `composer install`:
 
-`npx skills experimental_install` (restore from the lock) installs into `.agents/skills/`, which
-Claude Code does not read — use `npx skills add … -a claude-code` instead.
+```bash
+npx skills experimental_install
+```
+
+It installs every skill at the ref in the lock into `.agents/skills/`; the committed symlinks
+make them visible to Claude Code.
+
+Move to another release: set `"ref"` of the skills in `skills-lock.json` to the new tag, run
+`npx skills experimental_install`, commit the lock. (`npx skills update` keeps the pinned ref.)
+
+Some skill sets need a one-time setup step — see their doc.
 
 Set `DISABLE_TELEMETRY=1` to stop the CLI from sending anonymous usage data.
 
@@ -78,8 +80,9 @@ Adding a skill:
 
 ```mermaid
 flowchart LR
-    A[skill added in skills/name] --> B[push to master]
-    B --> C[project: npx skills add / npx skills update -p]
-    C --> D[.claude/skills + skills-lock.json committed in the project]
-    D --> E[Claude Code uses the skill]
+    A[skill added in skills/name] --> B[push to master + release tag]
+    B --> C[project: npx skills add URL#tag / set ref in skills-lock.json]
+    C --> D[skills-lock.json + .claude/skills symlinks committed]
+    D --> E[colleague: npx skills experimental_install]
+    E --> F[Claude Code uses the skill]
 ```
