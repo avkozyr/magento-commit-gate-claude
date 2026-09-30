@@ -54,10 +54,11 @@ Fill in `.claude/perf-gate.conf`:
 | `BASE_URL` | no | override; default = first ddev hostname answering 200 over https on `PAGE_HOME` |
 | `PHP_VERSION` | no | override; default = ddev `DDEV_PHP_VERSION` |
 
-Commit `.claude/skills/`, `skills-lock.json`, `.claude/perf-gate.conf` and
-`.claude/settings.json`. Teammates and CI then need nothing.
+Commit `skills-lock.json`, `.claude/perf-gate.conf` and `.claude/settings.json`; gitignore the
+five installed skill folders. Each developer installs the skills once after cloning (the
+`npx skills add` command above — `perf-gate install` is only needed once per project).
 
-Update to the latest version: `npx skills update -p`, then commit.
+Update to the latest version: `npx skills update -p`.
 
 Requirements: ddev project, `phpstan.neon` (or `.dist`) in the project root, phpstan and phpmd
 in `vendor/bin`, `python3` on the host (hook input parsing).
