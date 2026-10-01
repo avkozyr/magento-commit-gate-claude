@@ -299,9 +299,10 @@ cmd_audit() {
     ddev exec "sudo sh -c 'echo xdebug.mode=profile > $INI; echo xdebug.start_with_request=trigger >> $INI; echo xdebug.output_dir=$CONTAINER_DIR >> $INI' && mkdir -p $CONTAINER_DIR && chmod 777 $CONTAINER_DIR && sudo supervisorctl restart php-fpm" >/dev/null \
         || die "profiler setup failed"
 
-    local count
+    local count stash_paths=(app/code app/design)
+    git ls-files --error-unmatch app/etc/config.php >/dev/null 2>&1 && stash_paths+=(app/etc/config.php)
     count=$(git stash list | wc -l)
-    git stash push -u -m "$STASH_MSG" -- app/code app/design >/dev/null || die "git stash failed"
+    git stash push -u -m "$STASH_MSG" -- "${stash_paths[@]}" >/dev/null || die "git stash failed"
     [ "$(git stash list | wc -l)" -gt "$count" ] || die "git stash stored nothing"
     STASHED=1
     [ -z "$(cmd_files)" ] || die "tree still has gated changes after stash"

@@ -30,7 +30,7 @@ popped, compiled DI rebuilt per side, query log always disabled again).
 
 What it does: reads the page paths from `.claude/perf-gate.conf` and base URL
 + PHP version from ddev (conf `BASE_URL` / `PHP_VERSION` override), enables the
-query log, stashes `app/code` + `app/design` (A), rebuilds, per page 2 warmups
+query log, stashes `app/code` + `app/design` + `app/etc/config.php` (A), rebuilds, per page 2 warmups
 + 1 measured request with a fresh cache-buster, pops the stash (B, diff hash
 verified), rebuilds, measures, tears down, prints `page | query A→B | status`.
 

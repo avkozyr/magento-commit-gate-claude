@@ -31,7 +31,7 @@ always returned to its previous state).
 
 What it does: reads the page paths from `.claude/perf-gate.conf` and base URL
 + PHP version from ddev (conf `BASE_URL` / `PHP_VERSION` override), enables
-the Xdebug profiler in trigger mode, stashes `app/code` + `app/design` (A),
+the Xdebug profiler in trigger mode, stashes `app/code` + `app/design` + `app/etc/config.php` (A),
 rebuilds, per page 2 warmups + 1 profiled request with a fresh cache-buster,
 pops the stash (B, diff hash verified), rebuilds, measures, tears down, prints
 `page | calls A→B | status`.
