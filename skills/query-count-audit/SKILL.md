@@ -39,6 +39,13 @@ changes; `1` degradation in either metric (the green metric still gets its
 marker, the red one none); `2` setup error (message says what — if it mentions
 the stash, check `git stash list` and `git status` first and tell the user).
 
+New modules: when the diff adds a module (new `app/code/<Vendor>/<Module>/registration.php`),
+A keeps that module's skeleton — `registration.php`, `etc/module.xml` and the B
+`app/etc/config.php` that enables it. The fixed per-request cost of one more registered
+module (component registration, module directory path lookups) is then on both sides
+and cancels out; B − A is only the module's real code (di, plugins, observers, layout).
+The run prints `[a] new module skeletons registered on A` with the module paths.
+
 ## Reading the result
 
 Per page: **B > A → 🔴**, no tolerance — every extra query must be explained.

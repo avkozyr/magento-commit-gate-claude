@@ -285,7 +285,8 @@ cmd_audit() {
     HASH=$(cmd_hash)
     INI="/etc/php/$PHP_VERSION/fpm/conf.d/zz-perf-gate.ini"
     STASH_MSG="perf-gate-audit $HASH"
-    STASHED=0 LOGGING=0 PROFILER=0 XDEBUG_WAS_ON=0 NEEDS_REBUILD=0
+    STASHED=0 LOGGING=0 PROFILER=0 XDEBUG_WAS_ON=0 NEEDS_REBUILD=0 SKELETONS=""
+    NEW_MODULES=$(new_modules)
     mkdir -p var/perf-gate
 
     trap audit_teardown EXIT
@@ -306,12 +307,14 @@ cmd_audit() {
     [ "$(git stash list | wc -l)" -gt "$count" ] || die "git stash stored nothing"
     STASHED=1
     [ -z "$(cmd_files)" ] || die "tree still has gated changes after stash"
+    seed_skeletons || die "seeding new module skeletons failed"
 
     NEEDS_REBUILD=1
     rebuild a || die "rebuild A failed"
     measure_side a
 
     case "$(git stash list -1)" in *"$STASH_MSG"*) ;; *) die "top stash is not the audit stash" ;; esac
+    clear_skeletons
     git stash pop >/dev/null || die "git stash pop failed"
     STASHED=0
     [ "$(cmd_hash)" = "$HASH" ] || die "working diff differs after stash pop"
@@ -326,6 +329,44 @@ cmd_audit() {
 
 cli() {
     ddev exec env XDEBUG_MODE=off "$@"
+}
+
+new_modules() {
+    {
+        git diff HEAD --name-only --diff-filter=A -- ':(glob)app/code/*/*/registration.php'
+        git ls-files --others --exclude-standard -- ':(glob)app/code/*/*/registration.php'
+    } | sed 's|/registration.php$||' | sort -u
+}
+
+stash_file() {
+    git show "stash@{0}:$1" 2>/dev/null || git show "stash@{0}^3:$1" 2>/dev/null
+}
+
+seed_skeletons() {
+    [ -n "$NEW_MODULES" ] || return 0
+    local dir path
+    for dir in $NEW_MODULES; do
+        for path in "$dir/registration.php" "$dir/etc/module.xml"; do
+            mkdir -p "$(dirname "$path")"
+            stash_file "$path" > "$path" || return 1
+            SKELETONS="$SKELETONS $path"
+        done
+    done
+    if git ls-files --error-unmatch app/etc/config.php >/dev/null 2>&1; then
+        stash_file app/etc/config.php > app/etc/config.php || return 1
+    fi
+    echo "[a] new module skeletons registered on A (bootstrap noise cancels out):" $NEW_MODULES
+}
+
+clear_skeletons() {
+    [ -n "$SKELETONS" ] || return 0
+    local path
+    for path in $SKELETONS; do
+        rm -f "$path"
+        rmdir -p "$(dirname "$path")" 2>/dev/null
+    done
+    git ls-files --error-unmatch app/etc/config.php >/dev/null 2>&1 && git checkout -- app/etc/config.php
+    SKELETONS=""
 }
 
 in_container() {
@@ -372,6 +413,7 @@ measure_side() {
 audit_teardown() {
     trap - EXIT INT TERM
     if [ "$STASHED" = 1 ]; then
+        clear_skeletons
         if git stash pop >/dev/null; then
             STASHED=0
         else
