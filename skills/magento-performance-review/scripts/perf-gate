@@ -315,7 +315,7 @@ cmd_audit() {
 
     case "$(git stash list -1)" in *"$STASH_MSG"*) ;; *) die "top stash is not the audit stash" ;; esac
     clear_skeletons
-    git stash pop >/dev/null || die "git stash pop failed"
+    git stash pop --index >/dev/null || die "git stash pop failed"
     STASHED=0
     [ "$(cmd_hash)" = "$HASH" ] || die "working diff differs after stash pop"
 
@@ -414,7 +414,7 @@ audit_teardown() {
     trap - EXIT INT TERM
     if [ "$STASHED" = 1 ]; then
         clear_skeletons
-        if git stash pop >/dev/null; then
+        if git stash pop --index >/dev/null; then
             STASHED=0
         else
             echo "perf-gate: git stash pop failed, working changes are kept in the stash ($STASH_MSG) — restore by hand" >&2
