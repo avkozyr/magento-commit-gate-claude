@@ -89,7 +89,7 @@ function readConf(file) {
         version: conf.LIGHTHOUSE_VERSION || die('LIGHTHOUSE_VERSION missing'),
         runs: Number(conf.RUNS || 3),
         devices: (conf.DEVICES || 'mobile desktop').split(/\s+/).filter(Boolean),
-        log: conf.LOG_FILE || 'docs/Performance/Prod-Lighthouse.md',
+        log: conf.LOG_FILE || 'docs/Performance/History-Lighthouse.md',
         sites,
     };
 }
@@ -230,7 +230,7 @@ function render(rows, meta, prev) {
 }
 
 function header(conf) {
-    return `# Prod Lighthouse
+    return `# Performance History — Lighthouse on production
 
 Lighthouse lab results on production, measured before and after each release. Newest first.
 

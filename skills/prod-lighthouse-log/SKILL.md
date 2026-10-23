@@ -1,6 +1,6 @@
 ---
 name: prod-lighthouse-log
-description: Measures the production storefront with Lighthouse (pinned version, median of N runs, mobile and desktop) just before and just after a release, and appends the results to the project's prod Lighthouse log (default docs/Performance/Prod-Lighthouse.md) with the delta vs the before run. Use when asked to measure, log or compare production frontend performance around a release or deploy.
+description: Measures the production storefront with Lighthouse (pinned version, median of N runs, mobile and desktop) just before and just after a release, and appends the results to the project's Lighthouse history (default docs/Performance/History-Lighthouse.md) with the delta vs the before run. Use when asked to measure, log or compare production frontend performance around a release or deploy.
 ---
 
 # Prod Lighthouse Log
