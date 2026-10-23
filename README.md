@@ -16,10 +16,12 @@ and CI need no access to this repository.
 | `magento-performance-review` | reviews the working diff for Magento performance anti-patterns |
 | `query-count-audit` | A/B SQL query count on homepage, PLP and PDP |
 | `call-count-audit` | A/B PHP function call count on homepage, PLP and PDP |
+| `prod-lighthouse-log` | Lighthouse on production before/after a release, logged with the delta |
 
 Skill sets with extra setup:
 
-- [Pre-commit gate](docs/pre-commit-gate.md) — the five skills above plus a hook that blocks
+- [Pre-commit gate](docs/pre-commit-gate.md) — `magento-phpstan-check`, `magento-phpmd-check`, `magento-performance-review`,
+  `query-count-audit` and `call-count-audit` plus a hook that blocks
   `git commit` until all of them pass
 
 ## Configuration

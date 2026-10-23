@@ -1,0 +1,6 @@
+LIGHTHOUSE_VERSION=13.5.0
+RUNS=3
+DEVICES="mobile desktop"
+LOG_FILE=docs/Performance/Prod-Lighthouse.md
+SITE_main=
+PAGES_main="home=/ plp= pdp="
