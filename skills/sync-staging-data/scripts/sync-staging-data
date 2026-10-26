@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHASES_ALL="preflight backup db media settings post verify cleanup"
+MUTATING="backup db media settings post cleanup"
+
+CORE_STRIP="@stripped @aggregated @idx @replica *_tmp cache cache_tag catalog_product_index_* catalog_category_product_index* catalog_product_bundle_price_index catalog_product_bundle_stock_index catalog_product_bundle_selection_price catalogrule_product* catalogrule_group_website* cataloginventory_stock_status* salesrule_product_attribute design_config_grid_flat catalog_product_frontend_action password_reset_request_event login_as_customer_log newsletter_queue* newsletter_problem sendfriend_log captcha_log magento_bulk* magento_operation magento_acknowledged_bulk import_history importexport_importdata"
+CORE_EXCLUDE="@trade @admin @oauth integration core_config_data tfa_* login_as_customer_assistance_allowed cron_schedule queue queue_* flag indexer_state mview_state catalog_compare_item catalog_compare_list salesrule_coupon_usage salesrule_customer"
+CORE_SETTINGS_BLACKLIST="web/unsecure/% web/secure/% web/cookie/% catalog/search/engine catalog/search/opensearch% catalog/search/elasticsearch% smile_elasticsuite_core_base_settings/% system/% dev/% admin/% twofactorauth/% paypal/% google/% googletagmanager/general/account googletagmanager/general/active sentry/% recaptcha_frontend/type_% recaptcha_backend/type_%"
+DEFAULT_MEDIA_EXCLUDES="catalog/product/cache/ tmp/ import/ import_export/ importexport/ captcha/ sitemap/ customer/ custom_options/ downloadable/ analytics/ *.sql *.sql.gz *.tar.gz"
+
+usage() {
+    cat <<'EOF'
+Usage: sync-staging-data <site> <phase|all> [--settings] [--dry-run] [--yes] [--conf FILE]
+
+Copies production data to staging for one site (host pair from the conf).
+Runs on your machine; staging pulls from production over its own SSH key.
+
+Phases (run one, or "all" in this order):
+  preflight  read-only checks on both hosts, prints the resolved table lists
+  backup     full dump of the staging DB to BACKUP_DIR
+  db         maintenance on, stream prod dump (minus EXCLUDE, STRIP) into staging
+  media      rsync prod media into staging (--delete, excludes kept)
+  settings   only with --settings: upsert prod core_config_data minus the blacklist
+  post       setup:upgrade, re-subscribe indexers, reindex, flush, maintenance off
+  verify     read-only checks, prints the summary
+  cleanup    legacy dump files, temp table, old backups
+
+Options:
+  --settings  include the settings phase in "all"
+  --dry-run   print what would happen; rsync -n; settings prints the diff
+  --yes       skip the confirmation gate
+  --conf      config file, default .claude/sync-staging-data.conf
+EOF
+}
+
+die() { printf 'sync-staging-data: %s\n' "$*" >&2; exit 1; }
+log() { printf '\n==> %s\n' "$*"; }
+
+CONF=.claude/sync-staging-data.conf
+SETTINGS=0
+DRY_RUN=0
+YES=0
+SITE=""
+PHASE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --settings) SETTINGS=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --yes) YES=1 ;;
+        --conf) CONF=$2; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*) usage >&2; die "unknown option $1" ;;
+        *)
+            if [ -z "$SITE" ]; then SITE=$1
+            elif [ -z "$PHASE" ]; then PHASE=$1
+            else usage >&2; die "unexpected argument $1"
+            fi ;;
+    esac
+    shift
+done
+[ -n "$SITE" ] && [ -n "$PHASE" ] || { usage >&2; exit 2; }
+
+[ -f "$CONF" ] || die "config $CONF not found; copy sync-staging-data.conf.dist there and fill in the hosts"
+# shellcheck disable=SC1090
+. "$CONF"
+MAGENTO_ROOT=${MAGENTO_ROOT:-/data/web/magento2/current}
+MEDIA_DIR=${MEDIA_DIR:-/data/web/magento2/shared/pub/media}
+BACKUP_DIR=${BACKUP_DIR:-/data/web/backups}
+DB=${DB:-magento2}
+KEEP_BACKUPS=${KEEP_BACKUPS:-3}
+MAIL_GUARD=${MAIL_GUARD:-}
+MEDIA_EXCLUDES=${MEDIA_EXCLUDES:-$DEFAULT_MEDIA_EXCLUDES}
+
+SITES=$(sed -n 's/^PROD_\([A-Za-z0-9_]*\)=.*/\1/p' "$CONF" | tr '\n' ' ')
+v=PROD_$SITE; PROD=${!v:-}
+v=STAGING_$SITE; STAGING=${!v:-}
+[ -n "$PROD" ] && [ -n "$STAGING" ] || die "unknown site '$SITE'; configured sites: ${SITES:-none}"
+case "$STAGING" in *staging*) ;; *) die "STAGING_$SITE='$STAGING' does not contain 'staging', refusing" ;; esac
+[ "$PROD" != "$STAGING" ] || die "PROD_$SITE and STAGING_$SITE are the same host"
+v=PAGES_$SITE; PAGES=${!v:-/}
+v=EXTRA_EXCLUDE_$SITE; EXCLUDE="$CORE_EXCLUDE ${!v:-${EXTRA_EXCLUDE:-}}"
+v=EXTRA_STRIP_$SITE; STRIP="$CORE_STRIP ${!v:-${EXTRA_STRIP:-}}"
+v=EXTRA_SETTINGS_BLACKLIST_$SITE; BLACKLIST="$CORE_SETTINGS_BLACKLIST ${!v:-${EXTRA_SETTINGS_BLACKLIST:-}}"
+
+# shellcheck disable=SC2089
+like=""
+for p in $BLACKLIST; do like="$like${like:+ OR }p.path LIKE '$p'"; done
+SETTINGS_KEEP="NOT ($like) AND (p.value IS NULL OR p.value NOT REGEXP '"'^[0-9]+:[0-9]+:[A-Za-z0-9+/=]+$'"')"
+
+case "$PHASE" in
+    all)
+        RUN="preflight backup db media"
+        [ "$SETTINGS" = 1 ] && RUN="$RUN settings"
+        RUN="$RUN post verify cleanup" ;;
+    settings) RUN=settings; SETTINGS=1 ;;
+    *)
+        case " $PHASES_ALL " in *" $PHASE "*) RUN=$PHASE ;; *) die "unknown phase '$PHASE'; phases: $PHASES_ALL" ;; esac ;;
+esac
+
+needs_gate=0
+for ph in $RUN; do case " $MUTATING " in *" $ph "*) needs_gate=1 ;; esac; done
+if [ "$needs_gate" = 1 ] && [ "$DRY_RUN" = 0 ] && [ "$YES" = 0 ]; then
+    cat <<EOF
+
+  site      $SITE
+  source    app@$PROD  (read only)
+  target    app@$STAGING  (DB replaced except excluded tables, media replaced, maintenance mode during db+post)
+  phases    $RUN
+  settings  $([ "$SETTINGS" = 1 ] && echo "YES, prod core_config_data minus blacklist" || echo no)
+
+Type the staging hostname to continue:
+EOF
+    read -r answer </dev/tty
+    [ "$answer" = "$STAGING" ] || die "aborted"
+fi
+
+r_log() { printf '\n--- [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+r_say() { printf '    %s\n' "$*"; }
+r_run() { printf '  $ %s\n' "$*" >&2; "$@"; }
+r_die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+r_prod() { ssh -o BatchMode=yes -o ConnectTimeout=15 "app@$PROD" "$@"; }
+r_prod_run() { printf '  $ ssh app@%s %s\n' "$PROD" "$*" >&2; r_prod "$@"; }
+r_mage() { printf '  $ bin/magento %s\n' "$*" >&2; (cd "$MAGENTO_ROOT" && bin/magento "$@"); }
+r_sql() { mysql "$DB" -N -e "$1"; }
+r_sql_run() { printf '  $ mysql %s -e "%s"\n' "$DB" "$(printf '%s' "$1" | tr '\n' ' ' | cut -c1-200)" >&2; mysql "$DB" -e "$1"; }
+r_table_exists() { [ "$(r_sql "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='$1'")" = 1 ]; }
+r_counts_cmd() {
+    printf 'for t in catalog_product_entity catalog_category_entity cms_page cms_block url_rewrite eav_attribute customer_entity sales_order admin_user core_config_data; do printf "%%s=%%s\\n" "$t" "$(mysql %s -N -e "SELECT COUNT(*) FROM $t")"; done' "$DB"
+}
+r_counts() { bash -c "$(r_counts_cmd)"; }
+r_legacy_files() { find /data/web -maxdepth 1 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.tar.gz' \) 2>/dev/null; }
+r_scheduled_indexer_ids() {
+    local info title
+    info=$(r_mage indexer:info)
+    r_mage indexer:show-mode | { grep 'Update by Schedule' || true; } | sed 's/ *:.*//' | while IFS= read -r title; do
+        printf '%s\n' "$info" | awk -v t="$title" '{ s = $0; sub(/^[^ ]+ +/, "", s); if (s == t) print $1 }'
+    done | sort -u | tr '\n' ' '
+}
+r_dump_cmd() {
+    printf "cd %s && php -d display_errors=stderr \$(command -v n98-magerun2) -q db:dump --stdout --force --no-tablespaces --set-gtid-purged-off --strip='%s' --exclude='%s'" "$MAGENTO_ROOT" "$STRIP" "$EXCLUDE"
+}
+
+r_preflight() {
+    r_log "preflight $SITE: $PROD -> $STAGING (running on $(hostname -f))"
+    r_say "step 1/7: can staging reach production over ssh?"
+    if ! r_prod_run -n true 2>/dev/null; then
+        cat <<EOF
+staging cannot ssh to app@$PROD. One-time setup:
+  1. on $STAGING:  ssh-keygen -t ed25519 -N '' -C app@$STAGING -f ~/.ssh/id_ed25519
+  2. on $PROD, append to ~/.ssh/authorized_keys:
+     from="$(hostname -I 2>/dev/null | awk '{print $1}')",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty $(cat ~/.ssh/id_ed25519.pub 2>/dev/null || echo '<content of ~/.ssh/id_ed25519.pub>')
+  3. on $STAGING:  ssh -o BatchMode=yes app@$PROD true
+EOF
+        exit 1
+    fi
+    echo "ssh staging -> prod: ok"
+    r_say "step 2/7: n98-magerun2 on production supports the dump options we need?"
+    local help
+    help=$(r_prod_run -n "n98-magerun2 db:dump --help")
+    for opt in --stdout --strip --exclude --no-tablespaces --set-gtid-purged-off --force --dry-run; do
+        printf '%s\n' "$help" | grep -q -- "$opt" || r_die "n98-magerun2 on $PROD lacks $opt"
+    done
+    echo "n98-magerun2 on prod: $(r_prod -n 'n98-magerun2 --version' | sed -n 1p)"
+    r_say "step 3/7: disk: production DB size vs free space on staging"
+    local prod_mb free_mb
+    prod_mb=$(r_prod_run -n "mysql -N -e \"SELECT ROUND(SUM(data_length+index_length)/1024/1024) FROM information_schema.TABLES WHERE table_schema='$DB'\"")
+    free_mb=$(df -Pm /data | awk 'NR==2 {print $4}')
+    echo "prod DB ${prod_mb} MB (all tables), staging free ${free_mb} MB"
+    [ "$free_mb" -gt "$prod_mb" ] || r_die "not enough disk on staging"
+    [ "$free_mb" -gt $((prod_mb * 2)) ] || echo "WARN: less than 2x the prod DB size free on staging"
+    echo "prod media disk:    $(r_prod -n 'df -Ph /data' | awk 'NR==2 {print $3" used, "$4" free"}')"
+    echo "staging media disk: $(df -Ph /data | awk 'NR==2 {print $3" used, "$4" free"}')"
+    r_say "step 4/7: staging state: maintenance mode, URL lock in env.php, mail guard"
+    r_mage maintenance:status | sed -n 1p
+    local base
+    base=$(r_mage config:show web/unsecure/base_url)
+    case "$base" in *"$STAGING"*) echo "base_url lock ok: $base" ;; *) r_die "web/unsecure/base_url on staging is '$base', expected the staging host; env.php lock missing" ;; esac
+    if [ -n "$MAIL_GUARD" ]; then
+        local path expect actual
+        path=${MAIL_GUARD%%=*}; expect=${MAIL_GUARD#*=}
+        actual=$(r_mage config:show "$path" 2>/dev/null || echo "")
+        if [ "$actual" = "$expect" ]; then echo "mail guard ok: $path=$actual"; else r_die "mail guard: $path='$actual', expected '$expect'"; fi
+    fi
+    r_say "step 5/7: indexers in 'Update by Schedule' mode (post re-subscribes exactly these)"
+    echo "scheduled indexers: $(r_scheduled_indexer_ids)"
+    r_say "step 6/7: row-count snapshot of staging, saved to $BACKUP_DIR/$SITE-preflight-counts.txt (verify compares against it)"
+    mkdir -p "$BACKUP_DIR"
+    r_counts | tee "$BACKUP_DIR/$SITE-preflight-counts.txt"
+    r_say "step 7/7: the dump command production will run (dry run, nothing dumped) and leftover dump files"
+    echo "STRIP (structure only, emptied on staging):"
+    echo "  $STRIP"
+    echo "EXCLUDE (not in the dump, staging keeps its rows):"
+    echo "  $EXCLUDE"
+    local out n
+    printf '  $ ssh app@%s %s --dry-run\n' "$PROD" "$(r_dump_cmd | sed 's/ -q / /')"
+    out=$(r_prod -n "$(r_dump_cmd | sed 's/ -q / /') --dry-run" 2>&1 | sed '/^[[:space:]]*$/d' || true)
+    n=$(printf '%s' "$out" | { grep -o -- '--ignore-table' || true; } | wc -l | tr -d ' ')
+    if [ "$n" -gt 0 ]; then echo "tables ignored by mysqldump: $n"
+    elif [ -z "$out" ]; then echo "dump options accepted by n98-magerun2 (dry run)"
+    else printf '%s\n' "$out" | sed -n 1,5p; fi
+    local f
+    f=$(r_legacy_files; r_prod -n "find /data/web -maxdepth 1 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.tar.gz' \) 2>/dev/null | sed 's/^/prod:/'")
+    [ -n "$f" ] && printf 'leftover dump files:\n%s\n' "$f"
+    echo "preflight ok"
+}
+
+r_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local f
+    f="$BACKUP_DIR/$SITE-staging-pre-sync-$(date +%Y%m%d-%H%M%S).sql.gz"
+    r_log "backup: full dump of the staging DB (restore point) -> $f"
+    printf '  $ mysqldump --single-transaction --no-tablespaces --set-gtid-purged=OFF %s | gzip > %s\n' "$DB" "$f"
+    if [ "$DRY_RUN" = 1 ]; then echo "dry run: not executed"; return; fi
+    mysqldump --single-transaction --no-tablespaces --set-gtid-purged=OFF "$DB" | gzip > "$f"
+    ls -lh "$f"
+    r_say "keeping the newest $KEEP_BACKUPS backups of $SITE, removing older ones:"
+    { ls -t "$BACKUP_DIR/$SITE"-staging-pre-sync-*.sql.gz 2>/dev/null || true; } | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -fv
+    r_say "restore: gunzip -c $f | mysql $DB"
+}
+
+r_db() {
+    r_log "db: stream the production dump straight into the staging DB (no file on either host)"
+    r_say "step 1/2: put staging in maintenance mode"
+    [ "$DRY_RUN" = 1 ] || r_mage maintenance:enable
+    r_say "step 2/2: production dumps, staging imports; the counter shows compressed bytes received"
+    printf '  $ ssh app@%s "%s | gzip -1" | pv | gunzip -c | sed DEFINER=...=CURRENT_USER | mysql %s\n' "$PROD" "$(r_dump_cmd)" "$DB"
+    if [ "$DRY_RUN" = 1 ]; then echo "dry run: not executed"; return; fi
+    local pv=cat
+    command -v pv >/dev/null && pv="pv -f -brt"
+    r_prod "$(r_dump_cmd) | gzip -1" \
+        | $pv \
+        | gunzip -c \
+        | LC_ALL=C sed -E 's/DEFINER[ ]*=[ ]*`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
+        | mysql "$DB"
+    echo "import done; staging stays in maintenance mode until post has finished"
+}
+
+r_media() {
+    r_log "media: rsync production media into staging (--delete removes files production no longer has)"
+    r_say "excluded, kept as they are on staging: $MEDIA_EXCLUDES"
+    local -a opts=(-a --delete "--info=progress2,stats2" --human-readable)
+    [ "$DRY_RUN" = 1 ] && opts+=(-n)
+    set -f
+    for e in $MEDIA_EXCLUDES; do opts+=(--exclude="$e"); done
+    set +f
+    r_run rsync "${opts[@]}" "app@$PROD:$MEDIA_DIR/" "$MEDIA_DIR/"
+}
+
+r_settings() {
+    r_log "settings: production core_config_data -> staging, blacklisted paths and encrypted values skipped"
+    local bak
+    bak="$BACKUP_DIR/$SITE-staging-core_config_data-$(date +%Y%m%d-%H%M%S).sql.gz"
+    r_say "step 1/5: backup of staging core_config_data -> $bak"
+    mkdir -p "$BACKUP_DIR"
+    mysqldump --single-transaction --no-tablespaces --set-gtid-purged=OFF "$DB" core_config_data | gzip > "$bak"
+    r_say "step 2/5: load production core_config_data into temp table core_config_data_prod on staging"
+    r_sql_run "CREATE TABLE IF NOT EXISTS core_config_data_prod LIKE core_config_data; TRUNCATE core_config_data_prod;"
+    r_prod_run "mysqldump --single-transaction --no-create-info --skip-triggers --skip-add-locks --no-tablespaces --set-gtid-purged=OFF $DB core_config_data" \
+        | sed 's/INSERT INTO `core_config_data`/INSERT INTO `core_config_data_prod`/' \
+        | mysql "$DB"
+    echo "prod rows: $(r_sql 'SELECT COUNT(*) FROM core_config_data_prod'), of which pass the blacklist: $(r_sql "SELECT COUNT(*) FROM core_config_data_prod p WHERE $SETTINGS_KEEP")"
+    r_say "step 3/5: rows that differ between production and staging and would be applied:"
+    mysql "$DB" -e "SELECT p.scope, p.scope_id, p.path, c.value AS staging, p.value AS prod FROM core_config_data_prod p LEFT JOIN core_config_data c USING (scope, scope_id, path) WHERE $SETTINGS_KEEP AND NOT (c.value <=> p.value) ORDER BY p.path, p.scope, p.scope_id"
+    if [ "$DRY_RUN" = 1 ]; then
+        r_sql_run "DROP TABLE core_config_data_prod"
+        echo "dry run: nothing applied"
+        return
+    fi
+    r_say "step 4/5: apply (update existing rows, insert missing ones; staging-only rows untouched)"
+    r_sql_run "UPDATE core_config_data c JOIN core_config_data_prod p USING (scope, scope_id, path) SET c.value = p.value, c.updated_at = NOW() WHERE $SETTINGS_KEEP AND NOT (c.value <=> p.value); SELECT ROW_COUNT() AS updated;"
+    r_sql_run "INSERT INTO core_config_data (scope, scope_id, path, value) SELECT p.scope, p.scope_id, p.path, p.value FROM core_config_data_prod p LEFT JOIN core_config_data c USING (scope, scope_id, path) WHERE c.config_id IS NULL AND $SETTINGS_KEEP; SELECT ROW_COUNT() AS inserted;"
+    r_say "step 5/5: drop temp table, flush cache"
+    r_sql_run "DROP TABLE core_config_data_prod"
+    r_mage cache:flush
+}
+
+r_post() {
+    r_log "post: bring the imported data in line with the staging code, rebuild indexes, reopen staging"
+    if [ "$DRY_RUN" = 1 ]; then echo "dry run: setup:upgrade, drop trg_% triggers, re-subscribe [$(r_scheduled_indexer_ids)], orphan cleanup, indexer:reindex, cache:flush, varnish ban, maintenance:disable"; return; fi
+    r_say "step 1/7: setup:upgrade applies schema and data patches that staging has and production has not yet"
+    r_mage setup:upgrade --keep-generated
+    r_say "step 2/7: drop the triggers that came with the production dump (they belong to production's indexer subscriptions)"
+    echo "triggers before: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
+    r_sql "SELECT CONCAT('DROP TRIGGER IF EXISTS \`', TRIGGER_NAME, '\`;') FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'trg_%'" | mysql "$DB"
+    local ids
+    ids=$(r_scheduled_indexer_ids)
+    r_say "step 3/7: re-subscribe the scheduled indexers so staging gets its own triggers again: ${ids:-none}"
+    if [ -n "$ids" ]; then
+        # shellcheck disable=SC2086
+        r_mage indexer:set-mode realtime $ids
+        # shellcheck disable=SC2086
+        r_mage indexer:set-mode schedule $ids
+    fi
+    echo "triggers after: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
+    r_say "step 4/7: orphan cleanup: reviews of unknown customers, cart and wishlist items of products that no longer exist"
+    r_table_exists review_detail && r_sql_run "UPDATE review_detail rd LEFT JOIN customer_entity c ON c.entity_id = rd.customer_id SET rd.customer_id = NULL WHERE rd.customer_id IS NOT NULL AND c.entity_id IS NULL"
+    r_table_exists quote_item && r_sql_run "DELETE qi FROM quote_item qi LEFT JOIN catalog_product_entity p ON p.entity_id = qi.product_id WHERE p.entity_id IS NULL"
+    r_table_exists wishlist_item && r_sql_run "DELETE wi FROM wishlist_item wi LEFT JOIN catalog_product_entity p ON p.entity_id = wi.product_id WHERE p.entity_id IS NULL"
+    r_say "step 5/7: full reindex (includes the search indices); this is the long step"
+    r_mage indexer:reindex
+    r_say "step 6/7: flush Magento cache and Varnish"
+    r_mage cache:flush
+    command -v varnishadm >/dev/null && r_run varnishadm 'ban req.url ~ .' >/dev/null || true
+    r_say "step 7/7: staging back online"
+    r_mage maintenance:disable
+}
+
+r_verify() {
+    r_log "verify $SITE: read-only checks on staging and production"
+    local fail=0
+    r_say "maintenance mode and indexer status on staging"
+    r_mage maintenance:status | sed -n 1p
+    r_mage indexer:status | grep -vi 'ready\|valid' | grep -v '^+' | grep -v 'Title' | sed 's/^/indexer not ready: /' || true
+    r_say "synced tables must have the same row count on both hosts"
+    echo "row counts prod / staging:"
+    local prod_counts staging_counts before
+    prod_counts=$(r_prod_run -n "$(r_counts_cmd)")
+    staging_counts=$(r_counts)
+    before=$(cat "$BACKUP_DIR/$SITE-preflight-counts.txt" 2>/dev/null || true)
+    for t in catalog_product_entity catalog_category_entity cms_page cms_block url_rewrite eav_attribute; do
+        local p s
+        p=$(printf '%s\n' "$prod_counts" | sed -n "s/^$t=//p"); s=$(printf '%s\n' "$staging_counts" | sed -n "s/^$t=//p")
+        if [ "$p" = "$s" ]; then printf '  %-28s %10s %10s ok\n' "$t" "$p" "$s"; else printf '  %-28s %10s %10s DIFF\n' "$t" "$p" "$s"; fail=1; fi
+    done
+    r_say "staging-owned tables must be unchanged since preflight (core_config_data changes only after --settings)"
+    echo "staging-owned rows before / after:"
+    for t in customer_entity sales_order admin_user core_config_data; do
+        local b s
+        b=$(printf '%s\n' "$before" | sed -n "s/^$t=//p"); s=$(printf '%s\n' "$staging_counts" | sed -n "s/^$t=//p")
+        if [ "$b" = "$s" ]; then printf '  %-28s %10s %10s ok\n' "$t" "$b" "$s"; else printf '  %-28s %10s %10s changed\n' "$t" "${b:-?}" "$s"; fi
+    done
+    r_say "URL lock, trigger count, scheduled indexers not stuck behind their changelog"
+    echo "base_url: $(r_mage config:show web/unsecure/base_url)"
+    echo "triggers: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
+    r_sql "SELECT view_id, version_id FROM mview_state WHERE mode = 'enabled'" | while read -r view ver; do
+        local max
+        max=$(r_sql "SELECT COALESCE(MAX(version_id), 0) FROM ${view}_cl" 2>/dev/null || echo 0)
+        [ "$ver" -gt "$max" ] && echo "WARN mview $view version $ver ahead of changelog $max"
+    done || true
+    r_say "pages on staging answer (401 = basic auth, fine; 5xx = broken)"
+    for p in $PAGES; do
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "https://$STAGING$p" || echo 000)
+        printf '  https://%s%s -> %s\n' "$STAGING" "$p" "$code"
+        case "$code" in 5*|000) fail=1 ;; esac
+    done
+    r_say "no temp table, no dump files lying around, backups present"
+    r_table_exists core_config_data_prod && { echo "temp table core_config_data_prod still present"; fail=1; }
+    local f
+    f=$(r_legacy_files; r_prod -n "find /data/web -maxdepth 1 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.tar.gz' \) 2>/dev/null | sed 's/^/prod:/'")
+    [ -n "$f" ] && printf 'leftover dump files:\n%s\n' "$f"
+    echo "backups: $({ ls "$BACKUP_DIR/$SITE"-staging-pre-sync-*.sql.gz 2>/dev/null || true; } | wc -l | tr -d ' ') in $BACKUP_DIR"
+    if [ "$fail" = 0 ]; then echo "verify ok"; else r_die "verify found problems"; fi
+}
+
+r_cleanup() {
+    r_log "cleanup: files of the old manual procedure, temp table, old backups"
+    local legacy="/data/web/migrated_data_export.sql /data/web/migrated_data_export.sql.tar.gz"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "dry run: would remove $legacy on both hosts, drop core_config_data_prod, keep $KEEP_BACKUPS backups"
+        return
+    fi
+    r_say "step 1/3: remove $legacy on staging and production (the only write on production)"
+    # shellcheck disable=SC2086
+    r_run rm -fv $legacy
+    r_prod_run -n "rm -fv $legacy"
+    r_say "step 2/3: drop the settings temp table if a run left it behind"
+    r_sql_run "DROP TABLE IF EXISTS core_config_data_prod"
+    r_say "step 3/3: keep the newest $KEEP_BACKUPS backups"
+    { ls -t "$BACKUP_DIR/$SITE"-staging-pre-sync-*.sql.gz 2>/dev/null || true; } | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -fv
+    local f
+    f=$(r_legacy_files; r_prod -n "find /data/web -maxdepth 1 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.tar.gz' \) 2>/dev/null | sed 's/^/prod:/'")
+    [ -n "$f" ] && printf 'other dump files left for a human to judge:\n%s\n' "$f"
+    echo "cleanup done"
+}
+
+remote() {
+    local payload
+    # shellcheck disable=SC2090,SC2046
+    payload="set -Eeuo pipefail
+trap 'echo \"ERROR: phase $1 failed at line \$LINENO: \$BASH_COMMAND\" >&2' ERR
+$(declare -p SITE PROD STAGING MAGENTO_ROOT MEDIA_DIR BACKUP_DIR DB KEEP_BACKUPS STRIP EXCLUDE SETTINGS_KEEP DRY_RUN PAGES MAIL_GUARD MEDIA_EXCLUDES)
+$(declare -f $(compgen -A function | grep '^r_' | tr '\n' ' '))
+r_$1"
+    ssh -n -o BatchMode=yes -o ConnectTimeout=15 "app@$STAGING" "bash -c $(printf '%q' "$payload")"
+}
+
+printf '\nsite %s: %s -> %s\nphases: %s%s\nevery command is printed with a leading "$" before it runs; "ssh app@%s" lines run on production, the rest on staging\n' \
+    "$SITE" "$PROD" "$STAGING" "$RUN" "$([ "$DRY_RUN" = 1 ] && echo ' (dry run)')" "$PROD"
+for ph in $RUN; do
+    start=$(date +%s)
+    log "$SITE: phase $ph$([ "$DRY_RUN" = 1 ] && echo ' (dry run)') started $(date +%H:%M:%S)"
+    remote "$ph"
+    printf '<== %s: phase %s finished in %ss\n' "$SITE" "$ph" "$(( $(date +%s) - start ))"
+done
+log "done: $RUN"

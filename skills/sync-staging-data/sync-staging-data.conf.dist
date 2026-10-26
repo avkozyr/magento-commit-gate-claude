@@ -1,0 +1,15 @@
+PROD_shop=shop.hypernode.io
+STAGING_shop=stagingshop.hypernode.io
+PAGES_shop="/ /some-category /some-product"
+
+MAGENTO_ROOT=/data/web/magento2/current
+MEDIA_DIR=/data/web/magento2/shared/pub/media
+BACKUP_DIR=/data/web/backups
+DB=magento2
+KEEP_BACKUPS=3
+
+MAIL_GUARD=
+
+EXTRA_EXCLUDE=""
+EXTRA_STRIP=""
+EXTRA_SETTINGS_BLACKLIST=""

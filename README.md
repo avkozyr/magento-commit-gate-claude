@@ -17,6 +17,7 @@ and CI need no access to this repository.
 | `query-count-audit` | A/B SQL query count on homepage, PLP and PDP |
 | `call-count-audit` | A/B PHP function call count on homepage, PLP and PDP |
 | `lighthouse-audit` | Lighthouse on configured live pages, median of N runs, logged to a history file |
+| `sync-staging-data` | copies production data (catalog, CMS, media, optional settings) to a Hypernode staging node, keeps staging's own customers, orders, config and admins |
 
 Skill sets with extra setup:
 
