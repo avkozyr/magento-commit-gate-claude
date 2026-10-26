@@ -190,8 +190,8 @@ r_diff_list() {
     added=$(LC_ALL=C comm -13 <(LC_ALL=C sort "$b") <(LC_ALL=C sort "$a"))
     removed=$(LC_ALL=C comm -23 <(LC_ALL=C sort "$b") <(LC_ALL=C sort "$a"))
     printf '  %-11s +%s added, -%s removed\n' "$label" "$(printf '%s' "$added" | grep -c . || true)" "$(printf '%s' "$removed" | grep -c . || true)"
-    [ -n "$added" ] && printf '%s\n' "$added" | head -10 | sed 's/^/      + /'
-    [ -n "$removed" ] && printf '%s\n' "$removed" | head -10 | sed 's/^/      - /'
+    [ -n "$added" ] && printf '%s\n' "$added" | sed -n '1,10s/^/      + /p'
+    [ -n "$removed" ] && printf '%s\n' "$removed" | sed -n '1,10s/^/      - /p'
     return 0
 }
 r_legacy_files() { find /data/web -maxdepth 1 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.tar.gz' \) 2>/dev/null; }
@@ -349,7 +349,7 @@ r_settings() {
     r_say "step 3/5: rows that differ between production and staging and would be applied:"
     local applied
     applied="$BACKUP_DIR/$SITE-settings-applied-$(date +%Y%m%d-%H%M%S).txt"
-    mysql "$DB" -e "SELECT p.scope, p.scope_id, p.path, c.value AS staging, p.value AS prod FROM core_config_data_prod p LEFT JOIN core_config_data c USING (scope, scope_id, path) WHERE $SETTINGS_KEEP AND NOT (c.value <=> p.value) ORDER BY p.path, p.scope, p.scope_id" | tee "$applied"
+    mysql "$DB" -e "SELECT p.scope, p.scope_id, p.path, c.value AS staging, p.value AS prod FROM core_config_data_prod p LEFT JOIN core_config_data c USING (scope, scope_id, path) WHERE $SETTINGS_KEEP AND (c.config_id IS NULL OR NOT (c.value <=> p.value)) ORDER BY p.path, p.scope, p.scope_id" | tee "$applied"
     if [ "$DRY_RUN" = 1 ]; then
         r_sql_run "DROP TABLE core_config_data_prod"
         rm -f "$applied"
