@@ -171,7 +171,13 @@ r_counts_cmd() {
 }
 r_counts() { bash -c "$(r_counts_cmd)"; }
 r_summary() { printf '%s\n' "$BACKUP_DIR/$SITE-sync-summary.txt"; }
-r_note() { printf '%s\n' "$*" >> "$(r_summary)"; }
+r_note() {
+    local f
+    f=$(r_summary)
+    { [ -f "$f" ] && grep -v "^${1%%=*}=" "$f" || true; } > "$f.tmp"
+    printf '%s\n' "$*" >> "$f.tmp"
+    mv "$f.tmp" "$f"
+}
 r_snapshot_lists() {
     local tag=$1
     r_sql "SELECT sku FROM catalog_product_entity" > "$BACKUP_DIR/$SITE-$tag-skus.txt"

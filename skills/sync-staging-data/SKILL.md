@@ -80,9 +80,11 @@ The user must be able to follow every step. Rules for running the skill:
    numbers that matter (sizes, counts, durations, `DIFF`/`WARN` lines), and
    which phase comes next. Wait for the user before the first mutating
    phase (`backup`).
-   After `verify`, relay its change summary as the result of the sync: the
-   before / now / prod table, what was added or removed, media and settings
-   figures. Every run starts with `preflight`, otherwise `verify` has no
+   After `verify`, paste its output verbatim in the reply, in a code block:
+   the before / now / prod table, the staging-owned rows, added / removed
+   lists, the URL check, pages, and the whole sync summary block. The user
+   does not see tool output, only the reply; a condensed version is not
+   enough. Every run starts with `preflight`, otherwise `verify` has no
    "before" to compare against.
 4. When a phase fails, show the `ERROR: phase … failed at line …` output,
    state what is now in which state (maintenance mode on or off, backup
