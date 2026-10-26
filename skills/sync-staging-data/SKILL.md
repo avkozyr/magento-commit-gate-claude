@@ -74,6 +74,10 @@ The user must be able to follow every step. Rules for running the skill:
    numbers that matter (sizes, counts, durations, `DIFF`/`WARN` lines), and
    which phase comes next. Wait for the user before the first mutating
    phase (`backup`) and before `settings`.
+   After `verify`, relay its change summary as the result of the sync: the
+   before / now / prod table, what was added or removed, media and settings
+   figures. Every run starts with `preflight`, otherwise `verify` has no
+   "before" to compare against.
 4. When a phase fails, show the `ERROR: phase … failed at line …` output,
    state what is now in which state (maintenance mode on or off, backup
    file name, temp table present or not) and propose the next command. Do
@@ -89,7 +93,7 @@ The user must be able to follow every step. Rules for running the skill:
 | `media` | `rsync --delete` of prod media; excluded dirs are kept | resumes |
 | `settings` | only with `--settings`: prod `core_config_data` upserted into staging minus the blacklist and every encrypted value; staging-only rows survive | safe |
 | `post` | `setup:upgrade`, drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
-| `verify` | read-only: counts prod vs staging, staging-owned counts vs snapshot, pages answer, no temp table, no dump files | always safe |
+| `verify` | read-only: per synced table before / now / prod / change, staging-owned counts vs snapshot, products, categories and CMS pages added or removed (first 10 listed), pages answer, no temp table, no dump files, then the sync summary (dump size and time, media files created / deleted / transferred, settings rows updated / inserted with the saved list, triggers, durations) | always safe; run it right after `post`, production keeps changing |
 | `cleanup` | removes the old manual's `migrated_data_export.sql*` on both hosts, drops the temp table, prunes backups; lists other dump files without deleting | safe |
 
 Staging is in maintenance mode from `db` until the end of `post`. When a run
