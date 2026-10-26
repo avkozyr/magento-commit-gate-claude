@@ -50,7 +50,7 @@ From the project root, local shell (not ddev):
 
 ```bash
 .claude/skills/sync-staging-data/scripts/sync-staging-data <site> all
-.claude/skills/sync-staging-data/scripts/sync-staging-data <site> all --settings
+.claude/skills/sync-staging-data/scripts/sync-staging-data <site> all --no-settings
 .claude/skills/sync-staging-data/scripts/sync-staging-data <site> <phase> [--dry-run]
 ```
 
@@ -73,7 +73,7 @@ The user must be able to follow every step. Rules for running the skill:
 3. After each phase, report to the user in a few lines: what ran, the
    numbers that matter (sizes, counts, durations, `DIFF`/`WARN` lines), and
    which phase comes next. Wait for the user before the first mutating
-   phase (`backup`) and before `settings`.
+   phase (`backup`).
    After `verify`, relay its change summary as the result of the sync: the
    before / now / prod table, what was added or removed, media and settings
    figures. Every run starts with `preflight`, otherwise `verify` has no
@@ -91,7 +91,7 @@ The user must be able to follow every step. Rules for running the skill:
 | `backup` | full staging DB dump to `BACKUP_DIR`, keeps `KEEP_BACKUPS` | safe |
 | `db` | `maintenance:enable`, streams the prod dump into staging (no file on either host), `DEFINER` rewritten to `CURRENT_USER` | safe, drops and recreates the synced tables |
 | `media` | `rsync --delete` of prod media; excluded dirs are kept | resumes |
-| `settings` | only with `--settings`: prod `core_config_data` upserted into staging minus the blacklist and every encrypted value; staging-only rows survive | safe |
+| `settings` | prod `core_config_data` upserted into staging minus the blacklist and every encrypted value; staging-only rows survive; left out with `--no-settings` | safe |
 | `post` | `setup:upgrade`, drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
 | `verify` | read-only: per synced table before / now / prod / change, staging-owned counts vs snapshot, products, categories and CMS pages added or removed (first 10 listed), pages answer, no temp table, no dump files, then the sync summary (dump size and time, media files created / deleted / transferred, settings rows updated / inserted with the saved list, triggers, durations) | always safe; run it right after `post`, production keeps changing |
 | `cleanup` | removes the old manual's `migrated_data_export.sql*` on both hosts, drops the temp table, prunes backups; lists other dump files without deleting | safe |
@@ -120,10 +120,14 @@ imported data, exactly as the next production deploy will.
 
 ## Settings phase
 
-Opt-in with `--settings`. Every row from production is applied unless its
+Part of every `all` run (`--no-settings` leaves it out). Every row from production is applied unless its
 path matches the blacklist or its value is encrypted (`n:n:base64`). Built-in
-blacklist: base and link URLs, cookies, search engine hosts, `system/*`,
-`dev/*`, `admin/*`, 2FA, PayPal, Google/GTM ids, Sentry, reCAPTCHA keys.
+blacklist: any path containing `/api/`, `api_key`, `api_secret`, `endpoint`,
+`base_url`, `secret`, `token`, `password`, `webhook`, `enable_live`, `sandbox`
+or `mock` (integration endpoints, credentials and live/test switches, also
+when stored in plain text), plus base and link URLs, cookies, search engine
+hosts, `system/*`, `dev/*`, `admin/*`, 2FA, PayPal, Google/GTM ids, Sentry,
+reCAPTCHA keys.
 Project credentials and modes (payment providers, POS, CDP keys, consent
 ids, tax providers) go into `EXTRA_SETTINGS_BLACKLIST`. Use
 `settings --dry-run` first: it prints every row that would change.

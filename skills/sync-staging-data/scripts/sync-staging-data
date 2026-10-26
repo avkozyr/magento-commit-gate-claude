@@ -6,14 +6,14 @@ MUTATING="backup db media settings post cleanup"
 
 CORE_STRIP="@stripped @aggregated @idx @replica *_tmp cache cache_tag catalog_product_index_* catalog_category_product_index* catalog_product_bundle_price_index catalog_product_bundle_stock_index catalog_product_bundle_selection_price catalogrule_product* catalogrule_group_website* cataloginventory_stock_status* salesrule_product_attribute design_config_grid_flat catalog_product_frontend_action password_reset_request_event login_as_customer_log newsletter_queue* newsletter_problem sendfriend_log captcha_log magento_bulk* magento_operation magento_acknowledged_bulk import_history importexport_importdata"
 CORE_EXCLUDE="@trade @admin @oauth integration core_config_data tfa_* login_as_customer_assistance_allowed cron_schedule queue queue_* flag indexer_state mview_state catalog_compare_item catalog_compare_list salesrule_coupon_usage salesrule_customer"
-CORE_SETTINGS_BLACKLIST="web/unsecure/% web/secure/% web/cookie/% catalog/search/engine catalog/search/opensearch% catalog/search/elasticsearch% smile_elasticsuite_core_base_settings/% system/% dev/% admin/% twofactorauth/% paypal/% google/% googletagmanager/general/account googletagmanager/general/active sentry/% recaptcha_frontend/type_% recaptcha_backend/type_%"
+CORE_SETTINGS_BLACKLIST="%/api/% %api_key% %api_secret% %endpoint% %base_url% %secret% %token% %password% %webhook% %enable_live% %sandbox% %mock% web/unsecure/% web/secure/% web/cookie/% catalog/search/engine catalog/search/opensearch% catalog/search/elasticsearch% smile_elasticsuite_core_base_settings/% system/% dev/% admin/% twofactorauth/% paypal/% google/% googletagmanager/general/account googletagmanager/general/active sentry/% recaptcha_frontend/type_% recaptcha_backend/type_%"
 DEFAULT_MEDIA_EXCLUDES="catalog/product/cache/ tmp/ import/ import_export/ importexport/ captcha/ sitemap/ customer/ custom_options/ downloadable/ analytics/ *.sql *.sql.gz *.tar.gz"
 TABLES_SYNCED="catalog_product_entity catalog_category_entity catalog_product_entity_media_gallery eav_attribute eav_attribute_option url_rewrite cms_page cms_block review catalogrule salesrule"
 TABLES_OWN="customer_entity quote sales_order admin_user core_config_data"
 
 usage() {
     cat <<'EOF'
-Usage: sync-staging-data <site> <phase|all> [--settings] [--dry-run] [--yes] [--conf FILE]
+Usage: sync-staging-data <site> <phase|all> [--no-settings] [--dry-run] [--yes] [--conf FILE]
 
 Copies production data to staging for one site (host pair from the conf).
 Runs on your machine; staging pulls from production over its own SSH key.
@@ -23,13 +23,13 @@ Phases (run one, or "all" in this order):
   backup     full dump of the staging DB to BACKUP_DIR
   db         maintenance on, stream prod dump (minus EXCLUDE, STRIP) into staging
   media      rsync prod media into staging (--delete, excludes kept)
-  settings   only with --settings: upsert prod core_config_data minus the blacklist
+  settings   upsert prod core_config_data minus the blacklist (skip with --no-settings)
   post       setup:upgrade, re-subscribe indexers, reindex, flush, maintenance off
   verify     read-only checks, prints the summary
   cleanup    legacy dump files, temp table, old backups
 
 Options:
-  --settings  include the settings phase in "all"
+  --no-settings  leave the settings phase out of "all"
   --dry-run   print what would happen; rsync -n; settings prints the diff
   --yes       skip the confirmation gate
   --conf      config file, default .claude/sync-staging-data.conf
@@ -40,7 +40,7 @@ die() { printf 'sync-staging-data: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n==> %s\n' "$*"; }
 
 CONF=.claude/sync-staging-data.conf
-SETTINGS=0
+SETTINGS=1
 DRY_RUN=0
 YES=0
 SITE=""
@@ -48,6 +48,7 @@ PHASE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --settings) SETTINGS=1 ;;
+        --no-settings) SETTINGS=0 ;;
         --dry-run) DRY_RUN=1 ;;
         --yes) YES=1 ;;
         --conf) CONF=$2; shift ;;
@@ -109,7 +110,7 @@ if [ "$needs_gate" = 1 ] && [ "$DRY_RUN" = 0 ] && [ "$YES" = 0 ]; then
   source    app@$PROD  (read only)
   target    app@$STAGING  (DB replaced except excluded tables, media replaced, maintenance mode during db+post)
   phases    $RUN
-  settings  $([ "$SETTINGS" = 1 ] && echo "YES, prod core_config_data minus blacklist" || echo no)
+  settings  $([ "$SETTINGS" = 1 ] && echo "yes, prod core_config_data minus blacklist and encrypted values" || echo "no (--no-settings)")
 
 Type the staging hostname to continue:
 EOF
@@ -381,7 +382,7 @@ r_verify() {
         elif [ "$s" != "$b" ] && [ "$p" != n/a ] && [ "$s" != n/a ] && [ $(( (p > s ? p - s : s - p) * 100 )) -lt $(( p > 0 ? p : 1 )) ]; then printf '  %-38s %9s %9s %9s  %-6s drift (production changed since the dump)\n' "$t" "${b:-?}" "$s" "$p" "$d"
         else printf '  %-38s %9s %9s %9s  %-6s DIFF\n' "$t" "${b:-?}" "$s" "$p" "$d"; fail=1; fi
     done
-    r_say "staging-owned tables: must be unchanged since preflight (core_config_data changes only after --settings)"
+    r_say "staging-owned tables: must be unchanged since preflight (core_config_data grows when settings ran)"
     for t in $TABLES_OWN; do
         s=$(printf '%s\n' "$staging_counts" | sed -n "s/^$t=//p"); b=$(printf '%s\n' "$before" | sed -n "s/^$t=//p")
         if [ "$b" = "$s" ]; then printf '  %-38s %9s %9s %9s  %-6s ok\n' "$t" "$b" "$s" - 0; else printf '  %-38s %9s %9s %9s  %-6s changed\n' "$t" "${b:-?}" "$s" - "?"; fi
