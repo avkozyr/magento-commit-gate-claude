@@ -151,11 +151,13 @@ found in those columns.
 
 Part of every `all` run (`--no-settings` leaves it out). Every row from production is applied unless its
 path matches the blacklist or its value is encrypted (`n:n:base64`). Built-in
-blacklist: any path containing `/api/`, `api_key`, `api_secret`, `endpoint`,
-`base_url`, `secret`, `token`, `password`, `webhook`, `enable_live`, `sandbox`
-or `mock` (integration endpoints, credentials and live/test switches, also
-when stored in plain text), plus base and link URLs, cookies, search engine
-hosts, `system/*`, `dev/*`, `admin/*`, 2FA, PayPal, Google/GTM ids, Sentry,
+blacklist: any path containing `url`, `key`, `licen`, `/api/`, `api_secret`,
+`endpoint`, `secret`, `token`, `password`, `webhook`, `callback`,
+`enable_live`, `sandbox`, `mock`, `analytic` or `tracking` (every URL, key
+and licence, integration endpoints and callbacks, live/test switches,
+analytics, also when stored in plain text), plus cookies, search engine
+hosts, `system/*`, `dev/*`, `admin/*`, 2FA, PayPal, all of `google/*` and
+`googletagmanager/*`, `design/head/includes` (tracking snippets), Sentry,
 reCAPTCHA keys.
 Project credentials and modes (payment providers, POS, CDP keys, consent
 ids, tax providers) go into `EXTRA_SETTINGS_BLACKLIST`. Use
