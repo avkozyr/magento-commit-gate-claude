@@ -377,7 +377,9 @@ r_verify() {
     for t in $TABLES_SYNCED; do
         p=$(printf '%s\n' "$prod_counts" | sed -n "s/^$t=//p"); s=$(printf '%s\n' "$staging_counts" | sed -n "s/^$t=//p"); b=$(printf '%s\n' "$before" | sed -n "s/^$t=//p")
         case "$b$s" in *[!0-9]*) d="?" ;; "") d="?" ;; *) d=$(( s - b )); [ "$d" -ge 0 ] && d="+$d" ;; esac
-        if [ "$p" = "$s" ]; then printf '  %-38s %9s %9s %9s  %-6s ok\n' "$t" "${b:-?}" "$s" "$p" "$d"; else printf '  %-38s %9s %9s %9s  %-6s DIFF\n' "$t" "${b:-?}" "$s" "$p" "$d"; fail=1; fi
+        if [ "$p" = "$s" ]; then printf '  %-38s %9s %9s %9s  %-6s ok\n' "$t" "${b:-?}" "$s" "$p" "$d"
+        elif [ "$s" != "$b" ] && [ "$p" != n/a ] && [ "$s" != n/a ] && [ $(( (p > s ? p - s : s - p) * 100 )) -lt $(( p > 0 ? p : 1 )) ]; then printf '  %-38s %9s %9s %9s  %-6s drift (production changed since the dump)\n' "$t" "${b:-?}" "$s" "$p" "$d"
+        else printf '  %-38s %9s %9s %9s  %-6s DIFF\n' "$t" "${b:-?}" "$s" "$p" "$d"; fail=1; fi
     done
     r_say "staging-owned tables: must be unchanged since preflight (core_config_data changes only after --settings)"
     for t in $TABLES_OWN; do
