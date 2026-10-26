@@ -22,14 +22,20 @@ cp .claude/skills/sync-staging-data/sync-staging-data.conf.dist .claude/sync-sta
   as the project has (e.g. `life`, `belamo`). The staging host name must
   contain `staging`; the script refuses anything else.
 - `PAGES_<site>` — paths the `verify` phase requests on staging
+- `URL_MAP_<site>` — `prodhost=staginghost` pairs (one per website, e.g.
+  `www.shop.com=stagingshop.hypernode.io showroom.shop.com=showroom.stagingshop.hypernode.io`).
+  `post` replaces the production host with the staging host inside content
+  columns (menus, CMS, categories, widgets, config) so absolute links typed
+  by editors stay on staging. Unset: links keep pointing at production.
 - `MAGENTO_ROOT`, `MEDIA_DIR`, `BACKUP_DIR`, `DB`, `KEEP_BACKUPS` —
   Hypernode defaults, usually unchanged
 - `MAIL_GUARD=<config path>=<expected value>` — a setting that proves staging
   cannot send real mail (e.g. the mail transport switched off in `env.php`);
   `preflight` fails when it does not match
-- `EXTRA_EXCLUDE`, `EXTRA_STRIP`, `EXTRA_SETTINGS_BLACKLIST` — project
-  tables and config paths added to the built-in lists (below). A
-  `_<site>` suffix overrides per site.
+- `EXTRA_EXCLUDE`, `EXTRA_STRIP`, `EXTRA_SETTINGS_BLACKLIST`,
+  `EXTRA_URL_COLUMNS` — project tables, config paths and `table.column`
+  pairs added to the built-in lists (below). A `_<site>` suffix overrides
+  per site.
 
 Requirements: SSH as `app` to the staging host from the laptop, SSH from the
 staging host to production (the first `preflight` prints the key setup when it
@@ -92,8 +98,8 @@ The user must be able to follow every step. Rules for running the skill:
 | `db` | `maintenance:enable`, streams the prod dump into staging (no file on either host), `DEFINER` rewritten to `CURRENT_USER` | safe, drops and recreates the synced tables |
 | `media` | `rsync --delete` of prod media; excluded dirs are kept | resumes |
 | `settings` | prod `core_config_data` upserted into staging minus the blacklist and every encrypted value; staging-only rows survive; left out with `--no-settings` | safe |
-| `post` | `setup:upgrade`, drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
-| `verify` | read-only: per synced table before / now / prod / change, staging-owned counts vs snapshot, products, categories and CMS pages added or removed (first 10 listed), pages answer, no temp table, no dump files, then the sync summary (dump size and time, media files created / deleted / transferred, settings rows updated / inserted with the saved list, triggers, durations) | always safe; run it right after `post`, production keeps changing |
+| `post` | `setup:upgrade`, URL rewrite (`URL_MAP`), drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
+| `verify` | read-only: per synced table before / now / prod / change, staging-owned counts vs snapshot, products, categories and CMS pages added or removed (first 10 listed), no production host left in the URL columns, pages answer, no temp table, no dump files, then the sync summary (dump size and time, media files created / deleted / transferred, settings rows updated / inserted with the saved list, URL rows rewritten, triggers, durations) | always safe; run it right after `post`, production keeps changing |
 | `cleanup` | removes the old manual's `migrated_data_export.sql*` on both hosts, drops the temp table, prunes backups; lists other dump files without deleting | safe |
 
 Staging is in maintenance mode from `db` until the end of `post`. When a run
@@ -117,6 +123,27 @@ excluded table is not in the dump at all. Staging-owned data must be in the
 exclude list. `setup_module` and `patch_list` are synced on purpose: staging
 code that is ahead of production then applies its newer patches to the
 imported data, exactly as the next production deploy will.
+
+## URL rewrite
+
+Editors type absolute links (`https://www.shop.com/about`) into menus, CMS
+content, category descriptions and widgets; the dump brings them along and
+staging would send testers to production. `post` runs, per `URL_MAP` pair
+and per column in the built-in list (`snowmenu_node.content`,
+`cms_page.content`, `cms_block.content`, `catalog_category_entity_text.value`,
+`catalog_category_entity_varchar.value`, `catalog_product_entity_text.value`,
+`widget_instance.widget_parameters`, `url_rewrite.target_path`,
+`email_template.template_text`, `core_config_data.value`, plus
+`EXTRA_URL_COLUMNS`; missing tables are skipped):
+
+```sql
+UPDATE t SET c = REPLACE(c, 'www.shop.com', 'stagingshop.hypernode.io') WHERE c LIKE '%www.shop.com%'
+```
+
+Hostname only, so `https://`, JSON-escaped `https:\/\/` and protocol-relative
+links are all covered and e-mail addresses on the bare domain are untouched.
+Links to other sites stay. `verify` fails when a production host is still
+found in those columns.
 
 ## Settings phase
 

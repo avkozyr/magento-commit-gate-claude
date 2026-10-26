@@ -1,6 +1,7 @@
 PROD_shop=shop.hypernode.io
 STAGING_shop=stagingshop.hypernode.io
 PAGES_shop="/ /some-category /some-product"
+URL_MAP_shop="www.shop.com=stagingshop.hypernode.io"
 
 MAGENTO_ROOT=/data/web/magento2/current
 MEDIA_DIR=/data/web/magento2/shared/pub/media
@@ -13,3 +14,4 @@ MAIL_GUARD=
 EXTRA_EXCLUDE=""
 EXTRA_STRIP=""
 EXTRA_SETTINGS_BLACKLIST=""
+EXTRA_URL_COLUMNS=""

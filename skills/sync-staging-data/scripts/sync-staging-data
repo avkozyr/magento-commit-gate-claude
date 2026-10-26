@@ -10,6 +10,7 @@ CORE_SETTINGS_BLACKLIST="%/api/% %api_key% %api_secret% %endpoint% %base_url% %s
 DEFAULT_MEDIA_EXCLUDES="catalog/product/cache/ tmp/ import/ import_export/ importexport/ captcha/ sitemap/ customer/ custom_options/ downloadable/ analytics/ *.sql *.sql.gz *.tar.gz"
 TABLES_SYNCED="catalog_product_entity catalog_category_entity catalog_product_entity_media_gallery eav_attribute eav_attribute_option url_rewrite cms_page cms_block review catalogrule salesrule"
 TABLES_OWN="customer_entity quote sales_order admin_user core_config_data"
+CORE_URL_COLUMNS="snowmenu_node.content cms_page.content cms_block.content catalog_category_entity_text.value catalog_category_entity_varchar.value catalog_product_entity_text.value widget_instance.widget_parameters url_rewrite.target_path email_template.template_text core_config_data.value"
 
 usage() {
     cat <<'EOF'
@@ -85,6 +86,8 @@ v=PAGES_$SITE; PAGES=${!v:-/}
 v=EXTRA_EXCLUDE_$SITE; EXCLUDE="$CORE_EXCLUDE ${!v:-${EXTRA_EXCLUDE:-}}"
 v=EXTRA_STRIP_$SITE; STRIP="$CORE_STRIP ${!v:-${EXTRA_STRIP:-}}"
 v=EXTRA_SETTINGS_BLACKLIST_$SITE; BLACKLIST="$CORE_SETTINGS_BLACKLIST ${!v:-${EXTRA_SETTINGS_BLACKLIST:-}}"
+v=URL_MAP_$SITE; URL_MAP=${!v:-${URL_MAP:-}}
+v=EXTRA_URL_COLUMNS_$SITE; URL_COLUMNS="$CORE_URL_COLUMNS ${!v:-${EXTRA_URL_COLUMNS:-}}"
 
 # shellcheck disable=SC2089
 like=""
@@ -111,6 +114,7 @@ if [ "$needs_gate" = 1 ] && [ "$DRY_RUN" = 0 ] && [ "$YES" = 0 ]; then
   target    app@$STAGING  (DB replaced except excluded tables, media replaced, maintenance mode during db+post)
   phases    $RUN
   settings  $([ "$SETTINGS" = 1 ] && echo "yes, prod core_config_data minus blacklist and encrypted values" || echo "no (--no-settings)")
+  urls      ${URL_MAP:-none: URL_MAP_$SITE not set, absolute production URLs in content stay}
 
 Type the staging hostname to continue:
 EOF
@@ -128,6 +132,40 @@ r_mage() { printf '  $ bin/magento %s\n' "$*" >&2; (cd "$MAGENTO_ROOT" && bin/ma
 r_sql() { mysql "$DB" -N -e "$1"; }
 r_sql_run() { printf '  $ mysql %s -e "%s"\n' "$DB" "$(printf '%s' "$1" | tr '\n' ' ' | cut -c1-200)" >&2; mysql "$DB" -e "$1"; }
 r_table_exists() { [ "$(r_sql "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='$1'")" = 1 ]; }
+r_column_exists() { [ "$(r_sql "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='$1' AND COLUMN_NAME='$2'")" = 1 ]; }
+r_url_rewrite() {
+    local pair from to tc t c n total=0
+    if [ -z "$URL_MAP" ]; then echo "URL_MAP_$SITE not set: absolute production URLs in content stay as they are"; return; fi
+    for pair in $URL_MAP; do
+        from=${pair%%=*}; to=${pair#*=}
+        for tc in $URL_COLUMNS; do
+            t=${tc%.*}; c=${tc#*.}
+            r_column_exists "$t" "$c" || continue
+            n=$(r_sql "SELECT COUNT(*) FROM \`$t\` WHERE \`$c\` LIKE '%$from%'")
+            [ "$n" = 0 ] && continue
+            r_sql_run "UPDATE \`$t\` SET \`$c\` = REPLACE(\`$c\`, '$from', '$to') WHERE \`$c\` LIKE '%$from%'"
+            printf '  %s: %s rows, %s -> %s\n' "$tc" "$n" "$from" "$to"
+            total=$(( total + n ))
+        done
+    done
+    echo "rows rewritten: $total"
+    r_note "urls_rewritten=$total"
+}
+r_url_leftovers() {
+    local pair from tc t c n bad=0
+    if [ -z "$URL_MAP" ]; then echo "  URL_MAP_$SITE not set, not checked"; return; fi
+    for pair in $URL_MAP; do
+        from=${pair%%=*}
+        for tc in $URL_COLUMNS; do
+            t=${tc%.*}; c=${tc#*.}
+            r_column_exists "$t" "$c" || continue
+            n=$(r_sql "SELECT COUNT(*) FROM \`$t\` WHERE \`$c\` LIKE '%$from%'")
+            [ "$n" = 0 ] || { printf '  %s: %s rows still contain %s  DIFF\n' "$tc" "$n" "$from"; bad=1; }
+        done
+    done
+    [ "$bad" = 0 ] && echo "  none left (hosts: $(for pair in $URL_MAP; do printf '%s ' "${pair%%=*}"; done))"
+    return "$bad"
+}
 r_counts_cmd() {
     printf 'for t in %s %s; do printf "%%s=%%s\\n" "$t" "$(mysql %s -N -e "SELECT COUNT(*) FROM $t" 2>/dev/null || echo n/a)"; done' "$TABLES_SYNCED" "$TABLES_OWN" "$DB"
 }
@@ -211,7 +249,8 @@ EOF
     r_snapshot_lists before
     : > "$(r_summary)"
     r_note "run_started=$(date '+%F %T')"
-    r_say "step 7/7: the dump command production will run (dry run, nothing dumped) and leftover dump files"
+    r_say "step 7/7: the dump command production will run (dry run, nothing dumped), URL rewrite map and leftover dump files"
+    echo "URL rewrite in post (production host -> staging host inside content columns): ${URL_MAP:-none, URL_MAP_$SITE not set}"
     echo "STRIP (structure only, emptied on staging):"
     echo "  $STRIP"
     echo "EXCLUDE (not in the dump, staging keeps its rows):"
@@ -328,17 +367,19 @@ r_settings() {
 
 r_post() {
     r_log "post: bring the imported data in line with the staging code, rebuild indexes, reopen staging"
-    if [ "$DRY_RUN" = 1 ]; then echo "dry run: setup:upgrade, drop trg_% triggers, re-subscribe [$(r_scheduled_indexer_ids)], orphan cleanup, indexer:reindex, cache:flush, varnish ban, maintenance:disable"; return; fi
+    if [ "$DRY_RUN" = 1 ]; then echo "dry run: setup:upgrade, URL rewrite [${URL_MAP:-none}], drop trg_% triggers, re-subscribe [$(r_scheduled_indexer_ids)], orphan cleanup, indexer:reindex, cache:flush, varnish ban, maintenance:disable"; return; fi
     local t0
     t0=$(date +%s)
-    r_say "step 1/7: setup:upgrade applies schema and data patches that staging has and production has not yet"
+    r_say "step 1/8: setup:upgrade applies schema and data patches that staging has and production has not yet"
     r_mage setup:upgrade --keep-generated
-    r_say "step 2/7: drop the triggers that came with the production dump (they belong to production's indexer subscriptions)"
+    r_say "step 2/8: absolute production URLs in menus, CMS, categories, widgets and config point to staging"
+    r_url_rewrite
+    r_say "step 3/8: drop the triggers that came with the production dump (they belong to production's indexer subscriptions)"
     echo "triggers before: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
     r_sql "SELECT CONCAT('DROP TRIGGER IF EXISTS \`', TRIGGER_NAME, '\`;') FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'trg_%'" | mysql "$DB"
     local ids
     ids=$(r_scheduled_indexer_ids)
-    r_say "step 3/7: re-subscribe the scheduled indexers so staging gets its own triggers again: ${ids:-none}"
+    r_say "step 4/8: re-subscribe the scheduled indexers so staging gets its own triggers again: ${ids:-none}"
     if [ -n "$ids" ]; then
         # shellcheck disable=SC2086
         r_mage indexer:set-mode realtime $ids
@@ -346,16 +387,16 @@ r_post() {
         r_mage indexer:set-mode schedule $ids
     fi
     echo "triggers after: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
-    r_say "step 4/7: orphan cleanup: reviews of unknown customers, cart and wishlist items of products that no longer exist"
+    r_say "step 5/8: orphan cleanup: reviews of unknown customers, cart and wishlist items of products that no longer exist"
     r_table_exists review_detail && r_sql_run "UPDATE review_detail rd LEFT JOIN customer_entity c ON c.entity_id = rd.customer_id SET rd.customer_id = NULL WHERE rd.customer_id IS NOT NULL AND c.entity_id IS NULL"
     r_table_exists quote_item && r_sql_run "DELETE qi FROM quote_item qi LEFT JOIN catalog_product_entity p ON p.entity_id = qi.product_id WHERE p.entity_id IS NULL"
     r_table_exists wishlist_item && r_sql_run "DELETE wi FROM wishlist_item wi LEFT JOIN catalog_product_entity p ON p.entity_id = wi.product_id WHERE p.entity_id IS NULL"
-    r_say "step 5/7: full reindex (includes the search indices); this is the long step"
+    r_say "step 6/8: full reindex (includes the search indices); this is the long step"
     r_mage indexer:reindex
-    r_say "step 6/7: flush Magento cache and Varnish"
+    r_say "step 7/8: flush Magento cache and Varnish"
     r_mage cache:flush
     command -v varnishadm >/dev/null && r_run varnishadm 'ban req.url ~ .' >/dev/null || true
-    r_say "step 7/7: staging back online"
+    r_say "step 8/8: staging back online"
     r_mage maintenance:disable
     r_note "post_triggers=$(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
     r_note "post_indexers_resubscribed=${ids:-none}"
@@ -392,6 +433,8 @@ r_verify() {
     r_diff_list "products" "$BACKUP_DIR/$SITE-before-skus.txt" "$BACKUP_DIR/$SITE-after-skus.txt"
     r_diff_list "categories" "$BACKUP_DIR/$SITE-before-categories.txt" "$BACKUP_DIR/$SITE-after-categories.txt"
     r_diff_list "cms pages" "$BACKUP_DIR/$SITE-before-cms.txt" "$BACKUP_DIR/$SITE-after-cms.txt"
+    r_say "absolute production URLs left in content columns (post rewrote them to the staging host)"
+    r_url_leftovers || fail=1
     r_say "URL lock, trigger count, scheduled indexers not stuck behind their changelog"
     echo "base_url: $(r_mage config:show web/unsecure/base_url)"
     echo "triggers: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
@@ -430,6 +473,7 @@ r_verify() {
                 settings_updated) echo "  settings updated   $v rows" ;;
                 settings_inserted) echo "  settings inserted  $v rows" ;;
                 settings_list) echo "  settings list      $v" ;;
+                urls_rewritten) echo "  urls rewritten     $v rows" ;;
                 post_triggers) echo "  triggers           $v" ;;
                 post_indexers_resubscribed) echo "  indexers           $v" ;;
                 post_seconds) echo "  post duration      ${v}s" ;;
@@ -469,7 +513,7 @@ remote() {
     # shellcheck disable=SC2090,SC2046
     payload="set -Eeuo pipefail
 trap 'echo \"ERROR: phase $1 failed at line \$LINENO: \$BASH_COMMAND\" >&2' ERR
-$(declare -p SITE PROD STAGING MAGENTO_ROOT MEDIA_DIR BACKUP_DIR DB KEEP_BACKUPS STRIP EXCLUDE SETTINGS_KEEP DRY_RUN PAGES MAIL_GUARD MEDIA_EXCLUDES TABLES_SYNCED TABLES_OWN)
+$(declare -p SITE PROD STAGING MAGENTO_ROOT MEDIA_DIR BACKUP_DIR DB KEEP_BACKUPS STRIP EXCLUDE SETTINGS_KEEP DRY_RUN PAGES MAIL_GUARD MEDIA_EXCLUDES TABLES_SYNCED TABLES_OWN URL_MAP URL_COLUMNS)
 $(declare -f $(compgen -A function | grep '^r_' | tr '\n' ' '))
 r_$1"
     ssh -n -o BatchMode=yes -o ConnectTimeout=15 "app@$STAGING" "bash -c $(printf '%q' "$payload")"
