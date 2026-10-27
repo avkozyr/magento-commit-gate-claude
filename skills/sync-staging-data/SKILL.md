@@ -36,6 +36,12 @@ cp .claude/skills/sync-staging-data/sync-staging-data.conf.dist .claude/sync-sta
   `EXTRA_URL_COLUMNS` — project tables, config paths and `table.column`
   pairs added to the built-in lists (below). A `_<site>` suffix overrides
   per site.
+- `POST_MAGENTO_COMMANDS` — `;`-separated `bin/magento` commands (with their
+  arguments) that `post` runs right after `setup:upgrade`, e.g. a command
+  that installs staging-only test data the production import wiped. A
+  `_<site>` suffix overrides per site. A failing command prints a `WARN`
+  and `post` continues, so staging still comes back online. Make the
+  commands idempotent: `post` may run more than once.
 
 Requirements: SSH as `app` to the staging host from the laptop, SSH from the
 staging host to production (the first `preflight` prints the key setup when it
@@ -100,7 +106,7 @@ The user must be able to follow every step. Rules for running the skill:
 | `db` | `maintenance:enable`, streams the prod dump into staging (no file on either host), `DEFINER` rewritten to `CURRENT_USER` | safe, drops and recreates the synced tables |
 | `media` | `rsync --delete` of prod media; excluded dirs are kept | resumes |
 | `settings` | prod `core_config_data` upserted into staging minus the blacklist and every encrypted value; staging-only rows survive; left out with `--no-settings` | safe |
-| `post` | `setup:upgrade`, URL rewrite (`URL_MAP`), drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
+| `post` | `setup:upgrade`, `POST_MAGENTO_COMMANDS`, URL rewrite (`URL_MAP`), drops imported triggers and re-subscribes the scheduled indexers, orphan cleanup, `indexer:reindex`, cache + Varnish flush, `maintenance:disable` | safe |
 | `verify` | read-only: per synced table before / now / prod / change, staging-owned counts vs snapshot, products, categories and CMS pages added or removed (first 10 listed), no production host left in the URL columns, pages answer, no temp table, no dump files, then the sync summary (dump size and time, media files created / deleted / transferred, settings rows updated / inserted with the saved list, URL rows rewritten, triggers, durations) | always safe; run it right after `post`, production keeps changing |
 | `cleanup` | removes the old manual's `migrated_data_export.sql*` on both hosts, drops the temp table, prunes backups; lists other dump files without deleting | safe |
 

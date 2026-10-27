@@ -25,7 +25,7 @@ Phases (run one, or "all" in this order):
   db         maintenance on, stream prod dump (minus EXCLUDE, STRIP) into staging
   media      rsync prod media into staging (--delete, excludes kept)
   settings   upsert prod core_config_data minus the blacklist (skip with --no-settings)
-  post       setup:upgrade, re-subscribe indexers, reindex, flush, maintenance off
+  post       setup:upgrade, project commands, re-subscribe indexers, reindex, flush, maintenance off
   verify     read-only checks, prints the summary
   cleanup    legacy dump files, temp table, old backups
 
@@ -88,6 +88,7 @@ v=EXTRA_STRIP_$SITE; STRIP="$CORE_STRIP ${!v:-${EXTRA_STRIP:-}}"
 v=EXTRA_SETTINGS_BLACKLIST_$SITE; BLACKLIST="$CORE_SETTINGS_BLACKLIST ${!v:-${EXTRA_SETTINGS_BLACKLIST:-}}"
 v=URL_MAP_$SITE; URL_MAP=${!v:-${URL_MAP:-}}
 v=EXTRA_URL_COLUMNS_$SITE; URL_COLUMNS="$CORE_URL_COLUMNS ${!v:-${EXTRA_URL_COLUMNS:-}}"
+v=POST_MAGENTO_COMMANDS_$SITE; POST_COMMANDS=${!v:-${POST_MAGENTO_COMMANDS:-}}
 
 # shellcheck disable=SC2089
 like=""
@@ -115,6 +116,7 @@ if [ "$needs_gate" = 1 ] && [ "$DRY_RUN" = 0 ] && [ "$YES" = 0 ]; then
   phases    $RUN
   settings  $([ "$SETTINGS" = 1 ] && echo "yes, prod core_config_data minus blacklist and encrypted values" || echo "no (--no-settings)")
   urls      ${URL_MAP:-none: URL_MAP_$SITE not set, absolute production URLs in content stay}
+  commands  ${POST_COMMANDS:-none: POST_MAGENTO_COMMANDS_$SITE not set}
 
 Type the staging hostname to continue:
 EOF
@@ -371,21 +373,35 @@ r_settings() {
     r_mage cache:flush
 }
 
+r_post_commands() {
+    r_say "step 2/9: project commands after setup:upgrade: ${POST_COMMANDS:-none}"
+    [ -n "${POST_COMMANDS// /}" ] || return 0
+    local cmd
+    local -a cmds
+    IFS=';' read -ra cmds <<< "$POST_COMMANDS"
+    for cmd in "${cmds[@]}"; do
+        [ -n "${cmd// /}" ] || continue
+        # shellcheck disable=SC2086
+        r_mage $cmd || echo "WARN: bin/magento $cmd failed, post continues"
+    done
+}
+
 r_post() {
     r_log "post: bring the imported data in line with the staging code, rebuild indexes, reopen staging"
-    if [ "$DRY_RUN" = 1 ]; then echo "dry run: setup:upgrade, URL rewrite [${URL_MAP:-none}], drop trg_% triggers, re-subscribe [$(r_scheduled_indexer_ids)], orphan cleanup, indexer:reindex, cache:flush, varnish ban, maintenance:disable"; return; fi
+    if [ "$DRY_RUN" = 1 ]; then echo "dry run: setup:upgrade, commands [${POST_COMMANDS:-none}], URL rewrite [${URL_MAP:-none}], drop trg_% triggers, re-subscribe [$(r_scheduled_indexer_ids)], orphan cleanup, indexer:reindex, cache:flush, varnish ban, maintenance:disable"; return; fi
     local t0
     t0=$(date +%s)
-    r_say "step 1/8: setup:upgrade applies schema and data patches that staging has and production has not yet"
+    r_say "step 1/9: setup:upgrade applies schema and data patches that staging has and production has not yet"
     r_mage setup:upgrade --keep-generated
-    r_say "step 2/8: absolute production URLs in menus, CMS, categories, widgets and config point to staging"
+    r_post_commands
+    r_say "step 3/9: absolute production URLs in menus, CMS, categories, widgets and config point to staging"
     r_url_rewrite
-    r_say "step 3/8: drop the triggers that came with the production dump (they belong to production's indexer subscriptions)"
+    r_say "step 4/9: drop the triggers that came with the production dump (they belong to production's indexer subscriptions)"
     echo "triggers before: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
     r_sql "SELECT CONCAT('DROP TRIGGER IF EXISTS \`', TRIGGER_NAME, '\`;') FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'trg_%'" | mysql "$DB"
     local ids
     ids=$(r_scheduled_indexer_ids)
-    r_say "step 4/8: re-subscribe the scheduled indexers so staging gets its own triggers again: ${ids:-none}"
+    r_say "step 5/9: re-subscribe the scheduled indexers so staging gets its own triggers again: ${ids:-none}"
     if [ -n "$ids" ]; then
         # shellcheck disable=SC2086
         r_mage indexer:set-mode realtime $ids
@@ -393,16 +409,16 @@ r_post() {
         r_mage indexer:set-mode schedule $ids
     fi
     echo "triggers after: $(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
-    r_say "step 5/8: orphan cleanup: reviews of unknown customers, cart and wishlist items of products that no longer exist"
+    r_say "step 6/9: orphan cleanup: reviews of unknown customers, cart and wishlist items of products that no longer exist"
     r_table_exists review_detail && r_sql_run "UPDATE review_detail rd LEFT JOIN customer_entity c ON c.entity_id = rd.customer_id SET rd.customer_id = NULL WHERE rd.customer_id IS NOT NULL AND c.entity_id IS NULL"
     r_table_exists quote_item && r_sql_run "DELETE qi FROM quote_item qi LEFT JOIN catalog_product_entity p ON p.entity_id = qi.product_id WHERE p.entity_id IS NULL"
     r_table_exists wishlist_item && r_sql_run "DELETE wi FROM wishlist_item wi LEFT JOIN catalog_product_entity p ON p.entity_id = wi.product_id WHERE p.entity_id IS NULL"
-    r_say "step 6/8: full reindex (includes the search indices); this is the long step"
+    r_say "step 7/9: full reindex (includes the search indices); this is the long step"
     r_mage indexer:reindex
-    r_say "step 7/8: flush Magento cache and Varnish"
+    r_say "step 8/9: flush Magento cache and Varnish"
     r_mage cache:flush
     command -v varnishadm >/dev/null && r_run varnishadm 'ban req.url ~ .' >/dev/null || true
-    r_say "step 8/8: staging back online"
+    r_say "step 9/9: staging back online"
     r_mage maintenance:disable
     r_note "post_triggers=$(r_sql 'SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()')"
     r_note "post_indexers_resubscribed=${ids:-none}"
@@ -519,7 +535,7 @@ remote() {
     # shellcheck disable=SC2090,SC2046
     payload="set -Eeuo pipefail
 trap 'echo \"ERROR: phase $1 failed at line \$LINENO: \$BASH_COMMAND\" >&2' ERR
-$(declare -p SITE PROD STAGING MAGENTO_ROOT MEDIA_DIR BACKUP_DIR DB KEEP_BACKUPS STRIP EXCLUDE SETTINGS_KEEP DRY_RUN PAGES MAIL_GUARD MEDIA_EXCLUDES TABLES_SYNCED TABLES_OWN URL_MAP URL_COLUMNS)
+$(declare -p SITE PROD STAGING MAGENTO_ROOT MEDIA_DIR BACKUP_DIR DB KEEP_BACKUPS STRIP EXCLUDE SETTINGS_KEEP DRY_RUN PAGES MAIL_GUARD MEDIA_EXCLUDES TABLES_SYNCED TABLES_OWN URL_MAP URL_COLUMNS POST_COMMANDS)
 $(declare -f $(compgen -A function | grep '^r_' | tr '\n' ' '))
 r_$1"
     ssh -n -o BatchMode=yes -o ConnectTimeout=15 "app@$STAGING" "bash -c $(printf '%q' "$payload")"
