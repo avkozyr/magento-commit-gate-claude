@@ -446,7 +446,7 @@ report_metric() {
             status='🔴'
             red="$red $page"
         fi
-        printf '%-5s %24s  %s\n' "$page" "$a→$b" "$status"
+        printf '%-5s %24s  %s\n' "$page" "${a}→${b}" "$status"
     done
 
     if [ -z "$red" ]; then
