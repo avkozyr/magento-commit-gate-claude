@@ -1,14 +1,16 @@
 ---
 name: call-count-audit
-description: Deterministic PHP function-call-count gate — profiles one request per page (homepage, PLP, PDP) with the Xdebug profiler on the clean HEAD (A) and with the working changes (B) in one scripted run; any page where B executes more function calls than A flags red and blocks the commit. History (docs/Performance/History-Calls.md) is written only on degradation.
+description: Deterministic PHP function-call-count gate — profiles two requests per page (homepage, PLP, PDP) with the Xdebug profiler on the clean HEAD (A) and with the working changes (B) in one scripted run; any page where B executes more function calls than A flags red and blocks the commit. History (docs/Performance/History-Calls.md) is written only on degradation.
 ---
 
 # Call Count Audit (A/B)
 
-Counts the **total PHP function calls** of one FPC-bypassing request per page
+Counts the **total PHP function calls** of FPC-bypassing requests per page
 from an Xdebug cachegrind profile, on the clean HEAD (A) and with the working
 changes (B), and gates on the count. Call counts are deterministic: same code
-+ same cache procedure = the same count on any machine, under any load. This
++ same cache procedure = the same count on any machine, under any load — except
+for functions whose count varies between runs of the same code (shuffled hosts,
+sort comparators); each side is measured twice and those are left out. This
 catches the pure-PHP regression class the query gate cannot see: loop
 blowups, a method suddenly called thousands of times. Xdebug timing overhead
 is irrelevant — only counts are read. DB regressions are covered by
@@ -32,9 +34,9 @@ always returned to its previous state).
 What it does: reads the page paths from `.claude/perf-gate.conf` and base URL
 + PHP version from ddev (conf `BASE_URL` / `PHP_VERSION` override), enables
 the Xdebug profiler in trigger mode, stashes `app/code` + `app/design` + `app/etc/config.php` (A),
-rebuilds, per page 2 warmups + 1 profiled request with a fresh cache-buster,
+rebuilds, per page 2 warmups + 2 profiled requests with a fresh cache-buster,
 pops the stash (B, diff hash verified), rebuilds, measures, tears down, prints
-`page | calls A→B | status`.
+`page | calls A→B | stable A→B | noisy | status`.
 
 Exit codes: `0` queries and calls green (both markers written) or no gated
 changes; `1` degradation in either metric (the green metric still gets its
@@ -50,10 +52,13 @@ The run prints `[a] new module skeletons registered on A` with the module paths.
 
 ## Reading the result
 
-Per page: **B > A → 🔴**, no tolerance — every extra call must be explained.
-B ≤ A → ✅ (fewer is an improvement, note it). On 🔴 the script prints, per
-red page, the top 20 functions called more often (A/B counts). Profiles stay
-in the web container at `/tmp/perf-gate/<side>-<page>.cg` until the next run.
+Per page, on the stable totals: **B > A → 🔴**, no tolerance — every extra call
+must be explained. B ≤ A → ✅ (fewer is an improvement, note it). Functions whose
+count differed between a side's two runs are left out of both totals and listed
+under "left out" — mention them to the user; they are not a regression. On 🔴 the
+script prints, per red page, the top 20 stable functions called more often (A/B
+counts). Profiles stay in the web container at `/tmp/perf-gate/<run>-<page>.cg`
+(`a`, `a2`, `b`, `b2`) until the next run.
 
 Any 🔴: **alert the user explicitly** — page, both totals, the culprit
 functions. The commit stays blocked. Only the user can decide to proceed.
