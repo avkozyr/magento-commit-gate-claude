@@ -31,8 +31,9 @@ popped, compiled DI rebuilt per side, query log always disabled again).
 What it does: reads the page paths from `.claude/perf-gate.conf` and base URL
 + PHP version from ddev (conf `BASE_URL` / `PHP_VERSION` override), enables the
 query log, stashes `app/code` + `app/design` + `app/etc/config.php` (A), rebuilds, per page 2 warmups
-+ 1 measured request with a fresh cache-buster, pops the stash (B, diff hash
-verified), rebuilds, measures, tears down, prints `page | query A→B | status`.
++ 2 measured requests with a fresh cache-buster, pops the stash (B, diff hash
+verified), rebuilds, measures, tears down, prints
+`page | query A→B | stable A→B | noisy | status`.
 
 Exit codes: `0` queries and calls green (both markers written) or no gated
 changes; `1` degradation in either metric (the green metric still gets its
@@ -48,10 +49,13 @@ The run prints `[a] new module skeletons registered on A` with the module paths.
 
 ## Reading the result
 
-Per page: **B > A → 🔴**, no tolerance — every extra query must be explained.
-B ≤ A → ✅ (fewer is an improvement, note it). On 🔴 the script prints the
-added SQL statements per red page; the logs stay in the web container at
-`/tmp/perf-gate/<side>-<page>.sql.log` until the next run.
+Per page, on the stable totals: **B > A → 🔴**, no tolerance — every extra query
+must be explained. B ≤ A → ✅ (fewer is an improvement, note it). Statements are
+compared with literals replaced by `?`; a statement whose count differed between a
+side's two runs is left out of both totals and listed under "left out". On 🔴 the
+script prints the added SQL statements per red page; the logs stay in the web
+container at `/tmp/perf-gate/<run>-<page>.sql.log` (`a`, `a2`, `b`, `b2`) until the
+next run.
 
 Any 🔴: **alert the user explicitly** — page, both counts, the added queries.
 The commit stays blocked. Only the user can decide to proceed.

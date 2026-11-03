@@ -77,8 +77,10 @@ in `vendor/bin`, `python3` on the host (hook input parsing).
 - `mark perf|query|calls` — writes the marker for the current hash. Must run in its own Bash
   call before the commit: the hook runs before the command.
 - `audit` — A = `git stash push -u -- app/code app/design`, B = stash pop (diff hash verified).
-  Per side `setup:di:compile` + `cache:flush`, per page 2 warmups and one measured request with
-  a fresh cache-buster and `XDEBUG_TRIGGER=1`. Query log + Xdebug profiler (trigger mode) are
+  Per side `setup:di:compile` + `cache:flush`, per page 2 warmups and two measured requests with
+  a fresh cache-buster and `XDEBUG_TRIGGER=1`. Every function or SQL statement whose count differs
+  between a side's two runs is noise and is left out of both totals; the verdict compares the
+  remaining (stable) totals, and the report lists what was left out. Query log + Xdebug profiler (trigger mode) are
   enabled for the run only. All Magento CLI calls run with `XDEBUG_MODE=off` (with xdebug on,
   CLI PHP waits for an IDE forever); fpm restarts via `supervisorctl`; xdebug returns to its
   previous state. Each metric that is green on all pages gets its marker. Exit 0 = both green or
@@ -89,8 +91,16 @@ in `vendor/bin`, `python3` on the host (hook input parsing).
 Degradation history (only on degradation): `docs/Performance/History-Queries.md` and
 `docs/Performance/History-Calls.md`, written by the audit skills.
 
-Known limitation: a page whose query count varies between identical runs (e.g. batched swatch
-lookups on a PLP) can hide or fake a ±1 difference — pick stable pages for the conf.
+Noise calibration: some code paths run a different number of times on identical code —
+shuffled API hosts and the sort comparator that orders them (Algolia's `RetryStrategy`),
+batched lookups, time- or cache-state-dependent branches. Measuring each side twice finds them per
+run, per project, without configuration. SQL statements are compared with their literals replaced
+by `?` (and `IN (…)` lists collapsed), so the same statement with another id or timestamp is one
+key, and an N+1 shows as one statement with a count.
+
+Known limitation: a real increase inside a function or statement that is itself noisy is not
+counted. A regression almost always also adds calls to stable functions, so it still shows; check
+the "left out" list in the report when a change touches one of those code paths.
 
 ## Workflow Diagram
 

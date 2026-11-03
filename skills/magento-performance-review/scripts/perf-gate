@@ -190,7 +190,17 @@ Run each command in its own Bash call BEFORE the commit — the gate checks mark
 
 sql_counts() {
     awk '
-        function emit(s) { gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); count[s]++ }
+        # Literals become ?, so the same statement with another id or timestamp is one key
+        # (stable between runs, and an N+1 shows as one line with a count).
+        function norm(s,   out) {
+            gsub(/\047([^\047\\]|\\.)*\047/, "?", s)
+            out = ""
+            while (match(s, /[^A-Za-z0-9_][0-9]+(\.[0-9]+)?/)) { out = out substr(s, 1, RSTART) "?"; s = substr(s, RSTART + RLENGTH) }
+            s = out s
+            gsub(/\?(, ?\?)+/, "?+", s)
+            return s
+        }
+        function emit(s) { gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); count[norm(s)]++ }
         /^SQL: / { if (cur != "") emit(cur); cur = substr($0, 6); next }
         cur == "" { next }
         /^$/ || /^(AFF|TIME|BIND|## )/ { emit(cur); cur = ""; next }
@@ -216,11 +226,19 @@ call_counts() {
     '
 }
 
+# increases <a counts> <b counts> [noisy keys]: keys counted more often in b, noisy keys skipped
 increases() {
+    local noisy=${3:-/dev/null}
+    [ -f "$noisy" ] || noisy=/dev/null
     awk -F'\t' '
-        NR == FNR { a[$2] = $1; next }
-        { base = ($2 in a) ? a[$2] : 0; if ($1 > base) printf "%.0f\t%.0f\t%.0f\t%s\n", $1 - base, base, $1, $2 }
-    ' "$1" "$2" | sort -t"$(printf '\t')" -k1,1nr | head -n 20
+        FILENAME == ARGV[1] { skip[$NF] = 1; next }
+        FILENAME == ARGV[2] { a[$2] = $1; next }
+        !($2 in skip) { base = ($2 in a) ? a[$2] : 0; if ($1 > base) printf "%.0f\t%.0f\t%.0f\t%s\n", $1 - base, base, $1, $2 }
+    ' "$noisy" "$1" "$2" | sort -t"$(printf '\t')" -k1,1nr | head -n 20
+}
+
+counts_of() {
+    if [ "$1" = query ]; then sql_counts "$CONTAINER_DIR/$2.sql.log"; else call_counts "$CONTAINER_DIR/$2.cg"; fi
 }
 
 cmd_measure() {
@@ -241,16 +259,38 @@ cmd_measure() {
             zcat -f "$CONTAINER_DIR/$1.cg" | awk '/^calls=/ { split(substr($0, 7), part, " "); n += part[1] } END { printf "%.0f\n", n }'
             ;;
         diff-query)
-            sql_counts "$CONTAINER_DIR/$2.sql.log" > "$CONTAINER_DIR/diff-a"
-            sql_counts "$CONTAINER_DIR/$3.sql.log" > "$CONTAINER_DIR/diff-b"
+            counts_of query "a-$2" > "$CONTAINER_DIR/diff-a"
+            counts_of query "b-$2" > "$CONTAINER_DIR/diff-b"
             echo "Added SQL statements:"
-            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" | awk -F'\t' '{ printf "  +%s  %s\n", $1, substr($4, 1, 300) }'
+            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" "$CONTAINER_DIR/noisy-query-$2" | awk -F'\t' '{ printf "  +%s  %s\n", $1, substr($4, 1, 300) }'
             ;;
         diff-calls)
-            call_counts "$CONTAINER_DIR/$2.cg" > "$CONTAINER_DIR/diff-a"
-            call_counts "$CONTAINER_DIR/$3.cg" > "$CONTAINER_DIR/diff-b"
+            counts_of calls "a-$2" > "$CONTAINER_DIR/diff-a"
+            counts_of calls "b-$2" > "$CONTAINER_DIR/diff-b"
             echo "Functions called more often:"
-            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" | awk -F'\t' '{ printf "  +%s  %s (A=%s B=%s)\n", $1, $4, $2, $3 }'
+            increases "$CONTAINER_DIR/diff-a" "$CONTAINER_DIR/diff-b" "$CONTAINER_DIR/noisy-calls-$2" | awk -F'\t' '{ printf "  +%s  %s (A=%s B=%s)\n", $1, $4, $2, $3 }'
+            ;;
+        stable)
+            # stable <metric> <page>: each side was measured twice on identical code; a key whose
+            # count differs between a side's two runs is noise (shuffled hosts, sort comparators,
+            # time-dependent paths) and is left out of both totals. Prints: A B noisy-key-count
+            local run
+            for run in a a2 b b2; do counts_of "$2" "$run-$3" > "$CONTAINER_DIR/stable-$run"; done
+            awk -F'\t' -v out="$CONTAINER_DIR/noisy-$2-$3" '
+                { n = FILENAME; sub(/.*stable-/, "", n); c[n, $2] = $1; key[$2] = 1 }
+                END {
+                    printf "" > out
+                    for (k in key) {
+                        a = c["a", k] + 0; a2 = c["a2", k] + 0; b = c["b", k] + 0; b2 = c["b2", k] + 0
+                        if (a != a2 || b != b2) { noisy++; printf "A=%.0f/%.0f B=%.0f/%.0f\t%s\n", a, a2, b, b2, k > out; continue }
+                        ta += a; tb += b
+                    }
+                    printf "%.0f %.0f %d\n", ta, tb, noisy
+                }
+            ' "$CONTAINER_DIR/stable-a" "$CONTAINER_DIR/stable-a2" "$CONTAINER_DIR/stable-b" "$CONTAINER_DIR/stable-b2"
+            ;;
+        noisy)
+            awk -F'\t' '{ printf "  ~ %s (%s)\n", substr($2, 1, 200), $1 }' "$CONTAINER_DIR/noisy-$2-$3" | head -n 10
             ;;
         *) usage ;;
     esac
@@ -391,7 +431,7 @@ rebuild() {
 }
 
 measure_side() {
-    local side=$1 page url sep code query calls
+    local side=$1 page url sep code query calls run
     for page in home plp pdp; do
         url="$BASE_URL$(page_path "$page")"
         sep='?'
@@ -400,13 +440,16 @@ measure_side() {
             code=$(curl -sk -o /dev/null -w '%{http_code}' "${url}${sep}nc=warm")
             [ "$code" = 200 ] || die "[$side] warmup $url answered $code"
         done
-        in_container measure reset || die "[$side] measure reset failed"
-        code=$(curl -sk -o /dev/null -w '%{http_code}' "${url}${sep}nc=$side$$$RANDOM&XDEBUG_TRIGGER=1")
-        [ "$code" = 200 ] || die "[$side] $url answered $code"
-        query=$(in_container measure collect-query "$side-$page") || die "[$side] collecting $page queries failed"
-        calls=$(in_container measure collect-calls "$side-$page") || die "[$side] collecting $page calls failed"
-        eval "V_query_${side}_${page}=$query V_calls_${side}_${page}=$calls"
-        echo "[$side] $page: $query queries, $calls calls"
+        # Two measured runs per side: what differs between them is noise (see "measure stable").
+        for run in "$side" "${side}2"; do
+            in_container measure reset || die "[$side] measure reset failed"
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "${url}${sep}nc=$run$$$RANDOM&XDEBUG_TRIGGER=1")
+            [ "$code" = 200 ] || die "[$side] $url answered $code"
+            query=$(in_container measure collect-query "$run-$page") || die "[$side] collecting $page queries failed"
+            calls=$(in_container measure collect-calls "$run-$page") || die "[$side] collecting $page calls failed"
+            [ "$run" = "$side" ] && eval "V_query_${side}_${page}=$query V_calls_${side}_${page}=$calls"
+            echo "[$run] $page: $query queries, $calls calls"
+        done
     done
 }
 
@@ -437,16 +480,25 @@ audit_teardown() {
 }
 
 report_metric() {
-    local metric=$1 page a b status red=""
-    printf '\n%-5s %24s  %s\n' page "$metric A→B" status
+    local metric=$1 page a b sa sb noisy status red="" excluded=""
+    printf '\n%-5s %24s %24s %6s  %s\n' page "$metric A→B" "stable A→B" noisy status
     for page in home plp pdp; do
         eval "a=\$V_${metric}_a_$page b=\$V_${metric}_b_$page"
+        read -r sa sb noisy <<EOF
+$(in_container measure stable "$metric" "$page")
+EOF
+        [ -n "$sb" ] || die "comparing $metric on $page failed"
         status='✅'
-        if [ "$b" -gt "$a" ]; then
+        if [ "$sb" -gt "$sa" ]; then
             status='🔴'
             red="$red $page"
         fi
-        printf '%-5s %24s  %s\n' "$page" "${a}→${b}" "$status"
+        [ "$noisy" -gt 0 ] && excluded="$excluded $page"
+        printf '%-5s %24s %24s %6s  %s\n' "$page" "${a}→${b}" "${sa}→${sb}" "$noisy" "$status"
+    done
+    for page in $excluded; do
+        echo "$metric $page: left out, count differs between two runs of the same code:"
+        in_container measure noisy "$metric" "$page"
     done
 
     if [ -z "$red" ]; then
@@ -456,7 +508,7 @@ report_metric() {
     for page in $red; do
         echo
         echo "=== $metric $page ($BASE_URL$(page_path "$page"))"
-        in_container measure "diff-$metric" "a-$page" "b-$page"
+        in_container measure "diff-$metric" "$page"
     done
     echo "$metric: degradation on:$red — no marker written."
     return 1
