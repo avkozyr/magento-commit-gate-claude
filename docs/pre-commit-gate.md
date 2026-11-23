@@ -76,8 +76,10 @@ in `vendor/bin`, `python3` on the host (hook input parsing).
 - `files [--php]` / `hash` — gated file list / 12-char hash of the gated `git diff HEAD`.
 - `mark perf|query|calls` — writes the marker for the current hash. Must run in its own Bash
   call before the commit: the hook runs before the command.
-- `audit` — A = `git stash push -u -- app/code app/design`, B = stash pop (diff hash verified).
-  Per side `setup:di:compile` + `cache:flush`, per page 2 warmups and two measured requests with
+- `audit` — A = `git stash push -u -- app/code app/design`, B = `git stash apply` plus the index
+  of the stashed paths restored from the stash (diff hash verified), so staged changes outside
+  them (e.g. a submodule bump) don't break the restore. Per side `setup:di:compile` +
+  `cache:flush`, per page 2 warmups and two measured requests with
   a fresh cache-buster and `XDEBUG_TRIGGER=1`. Every function or SQL statement whose count differs
   between a side's two runs is noise and is left out of both totals; the verdict compares the
   remaining (stable) totals, and the report lists what was left out. Query log + Xdebug profiler (trigger mode) are
